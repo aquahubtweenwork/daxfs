@@ -3,7 +3,7 @@
 ifneq ($(KERNELRELEASE),)
 
 obj-m := daxfs.o
-daxfs-y := super.o inode.o dir.o file.o
+daxfs-y := super.o inode.o dir.o file.o delta.o branch.o dax_mem.o
 ccflags-y += -I$(src)/../include
 
 else

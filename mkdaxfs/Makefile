@@ -4,15 +4,17 @@ CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra
 CFLAGS += -I../include
 
-TARGET = mkdaxfs
-SRCS = mkdaxfs.c
+TARGETS = mkdaxfs
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(SRCS)
+mkdaxfs: mkdaxfs.c
 	$(CC) $(CFLAGS) -o $@ $^
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
 
-.PHONY: all clean
+install: $(TARGETS)
+	install -m 755 $(TARGETS) /usr/local/bin/
+
+.PHONY: all clean install

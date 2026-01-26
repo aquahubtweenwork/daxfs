@@ -33,6 +33,9 @@
 
 #include "daxfs_format.h"
 
+#define DAXFS_BRANCH_TABLE_SIZE		(DAXFS_MAX_BRANCHES * sizeof(struct daxfs_branch))
+#define DAXFS_DEFAULT_DELTA_SIZE	(64 * 1024 * 1024)  /* 64MB default delta region */
+
 /* From linux/dma-heap.h */
 struct dma_heap_allocation_data {
 	uint64_t len;
@@ -233,11 +236,14 @@ static void calculate_offsets(void)
 	}
 }
 
-static int write_image(void *mem, size_t mem_size, const char *src_dir)
+/*
+ * Write the base image portion (embedded read-only snapshot)
+ */
+static int write_base_image(void *mem, size_t mem_size, const char *src_dir)
 {
 	struct file_entry *e;
-	struct daxfs_super *super = mem;
-	struct daxfs_inode *inodes;
+	struct daxfs_base_super *base_super = mem;
+	struct daxfs_base_inode *inodes;
 	char *strtab;
 	uint64_t inode_offset = DAXFS_BLOCK_SIZE;
 	uint64_t strtab_offset = inode_offset + file_count * DAXFS_INODE_SIZE;
@@ -245,22 +251,22 @@ static int write_image(void *mem, size_t mem_size, const char *src_dir)
 
 	memset(mem, 0, mem_size);
 
-	super->magic = htole32(DAXFS_MAGIC);
-	super->version = htole32(DAXFS_VERSION);
-	super->flags = htole32(0);
-	super->block_size = htole32(DAXFS_BLOCK_SIZE);
-	super->inode_count = htole32(file_count);
-	super->root_inode = htole32(DAXFS_ROOT_INO);
-	super->inode_offset = htole64(inode_offset);
-	super->strtab_offset = htole64(strtab_offset);
-	super->strtab_size = htole64(strtab_size);
-	super->data_offset = htole64(data_offset);
+	base_super->magic = htole32(DAXFS_BASE_MAGIC);
+	base_super->version = htole32(1);
+	base_super->flags = htole32(0);
+	base_super->block_size = htole32(DAXFS_BLOCK_SIZE);
+	base_super->inode_count = htole32(file_count);
+	base_super->root_inode = htole32(DAXFS_ROOT_INO);
+	base_super->inode_offset = htole64(inode_offset);
+	base_super->strtab_offset = htole64(strtab_offset);
+	base_super->strtab_size = htole64(strtab_size);
+	base_super->data_offset = htole64(data_offset);
 
 	inodes = mem + inode_offset;
 	strtab = mem + strtab_offset;
 
 	for (e = files_head; e; e = e->next) {
-		struct daxfs_inode *di = &inodes[e->ino - 1];
+		struct daxfs_base_inode *di = &inodes[e->ino - 1];
 
 		di->ino = htole32(e->ino);
 		di->mode = htole32(e->st.st_mode);
@@ -306,7 +312,7 @@ static int write_image(void *mem, size_t mem_size, const char *src_dir)
 	return 0;
 }
 
-static size_t calculate_total_size(void)
+static size_t calculate_base_size(void)
 {
 	struct file_entry *e;
 	uint64_t inode_offset = DAXFS_BLOCK_SIZE;
@@ -329,8 +335,14 @@ static size_t calculate_total_size(void)
 #ifndef FSCONFIG_CMD_CREATE
 #define FSCONFIG_CMD_CREATE	6
 #endif
+#ifndef FSCONFIG_SET_FLAG
+#define FSCONFIG_SET_FLAG	0
+#endif
 #ifndef MOVE_MOUNT_F_EMPTY_PATH
 #define MOVE_MOUNT_F_EMPTY_PATH	0x00000004
+#endif
+#ifndef MOUNT_ATTR_RDONLY
+#define MOUNT_ATTR_RDONLY	0x00000001
 #endif
 
 static inline int sys_fsopen(const char *fstype, unsigned int flags)
@@ -360,7 +372,7 @@ static inline int sys_move_mount(int from_dfd, const char *from_path,
 /*
  * Mount a daxfs filesystem backed by a dma-buf fd using the new mount API.
  */
-static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint)
+static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint, bool writable)
 {
 	int fs_fd, mnt_fd;
 
@@ -376,13 +388,21 @@ static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint)
 		return -1;
 	}
 
+	if (writable) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_FLAG, "rw", NULL, 0) < 0) {
+			perror("fsconfig(FSCONFIG_SET_FLAG, rw)");
+			close(fs_fd);
+			return -1;
+		}
+	}
+
 	if (sys_fsconfig(fs_fd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0) {
 		perror("fsconfig(FSCONFIG_CMD_CREATE)");
 		close(fs_fd);
 		return -1;
 	}
 
-	mnt_fd = sys_fsmount(fs_fd, 0, 0);
+	mnt_fd = sys_fsmount(fs_fd, 0, writable ? 0 : MOUNT_ATTR_RDONLY);
 	if (mnt_fd < 0) {
 		perror("fsmount");
 		close(fs_fd);
@@ -401,6 +421,138 @@ static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint)
 	return 0;
 }
 
+/*
+ * Write static daxfs image (read-only, no branching)
+ * Layout: [Superblock (4KB)] [Base Image]
+ */
+static int write_static_image(void *mem, size_t mem_size, const char *src_dir,
+			      size_t base_size)
+{
+	struct daxfs_super *super = mem;
+	uint64_t base_offset = DAXFS_BLOCK_SIZE;
+
+	if (base_offset + base_size > mem_size) {
+		fprintf(stderr, "Error: image too large for allocated space\n");
+		return -1;
+	}
+
+	memset(mem, 0, mem_size);
+
+	/* Write superblock */
+	super->magic = htole32(DAXFS2_MAGIC);
+	super->version = htole32(DAXFS_VERSION);
+	super->flags = htole32(0);
+	super->block_size = htole32(DAXFS_BLOCK_SIZE);
+	super->total_size = htole64(base_offset + base_size);
+
+	super->base_offset = htole64(base_offset);
+	super->base_size = htole64(base_size);
+
+	/* No branch table or delta region for static images */
+	super->branch_table_offset = htole64(0);
+	super->branch_table_entries = htole32(0);
+	super->active_branches = htole32(0);
+	super->next_branch_id = htole64(0);
+	super->next_inode_id = htole64(file_count + 1);
+
+	super->delta_region_offset = htole64(0);
+	super->delta_region_size = htole64(0);
+	super->delta_alloc_offset = htole64(0);
+
+	/* Write embedded base image */
+	write_base_image(mem + base_offset, base_size, src_dir);
+
+	printf("Image layout (static):\n");
+	printf("  Superblock:    0x%x - 0x%x\n", 0, DAXFS_BLOCK_SIZE);
+	printf("  Base image:    0x%lx - 0x%lx (%zu bytes)\n",
+	       (unsigned long)base_offset,
+	       (unsigned long)(base_offset + base_size),
+	       base_size);
+
+	return 0;
+}
+
+/*
+ * Write daxfs image with branching support (read-write)
+ * Layout: [Superblock (4KB)] [Branch Table] [Base Image] [Delta Region]
+ */
+static int write_image(void *mem, size_t mem_size, const char *src_dir,
+		       size_t base_size, size_t delta_size)
+{
+	struct daxfs_super *super = mem;
+	uint64_t branch_table_offset;
+	uint64_t delta_region_offset;
+	uint64_t base_offset;
+
+	branch_table_offset = DAXFS_BLOCK_SIZE;
+	base_offset = ALIGN(branch_table_offset + DAXFS_BRANCH_TABLE_SIZE, DAXFS_BLOCK_SIZE);
+	delta_region_offset = ALIGN(base_offset + base_size, DAXFS_BLOCK_SIZE);
+
+	if (delta_region_offset + delta_size > mem_size) {
+		fprintf(stderr, "Error: image too large for allocated space\n");
+		return -1;
+	}
+
+	memset(mem, 0, mem_size);
+
+	/* Write superblock */
+	super->magic = htole32(DAXFS2_MAGIC);
+	super->version = htole32(DAXFS_VERSION);
+	super->flags = htole32(0);
+	super->block_size = htole32(DAXFS_BLOCK_SIZE);
+	super->total_size = htole64(delta_region_offset + delta_size);
+
+	super->base_offset = htole64(base_offset);
+	super->base_size = htole64(base_size);
+
+	super->branch_table_offset = htole64(branch_table_offset);
+	super->branch_table_entries = htole32(DAXFS_MAX_BRANCHES);
+	super->active_branches = htole32(0);  /* No branches yet, created on mount */
+	super->next_branch_id = htole64(1);
+	super->next_inode_id = htole64(file_count + 1);
+
+	super->delta_region_offset = htole64(delta_region_offset);
+	super->delta_region_size = htole64(delta_size);
+	super->delta_alloc_offset = htole64(delta_region_offset);
+
+	/* Branch table is already zeroed (FREE state) */
+
+	/* Write embedded base image */
+	write_base_image(mem + base_offset, base_size, src_dir);
+
+	printf("Image layout (with branching):\n");
+	printf("  Superblock:    0x%x - 0x%x\n", 0, DAXFS_BLOCK_SIZE);
+	printf("  Branch table:  0x%lx - 0x%lx (%u entries)\n",
+	       (unsigned long)branch_table_offset,
+	       (unsigned long)(branch_table_offset + DAXFS_BRANCH_TABLE_SIZE),
+	       DAXFS_MAX_BRANCHES);
+	printf("  Base image:    0x%lx - 0x%lx (%zu bytes)\n",
+	       (unsigned long)base_offset,
+	       (unsigned long)(base_offset + base_size),
+	       base_size);
+	printf("  Delta region:  0x%lx - 0x%lx (%zu bytes)\n",
+	       (unsigned long)delta_region_offset,
+	       (unsigned long)(delta_region_offset + delta_size),
+	       delta_size);
+
+	return 0;
+}
+
+static size_t calculate_static_size(size_t base_size)
+{
+	return DAXFS_BLOCK_SIZE + base_size;
+}
+
+static size_t calculate_total_size(size_t base_size, size_t delta_size)
+{
+	uint64_t branch_table_offset = DAXFS_BLOCK_SIZE;
+	uint64_t base_offset = ALIGN(branch_table_offset + DAXFS_BRANCH_TABLE_SIZE,
+				     DAXFS_BLOCK_SIZE);
+	uint64_t delta_region_offset = ALIGN(base_offset + base_size, DAXFS_BLOCK_SIZE);
+
+	return delta_region_offset + delta_size;
+}
+
 static void print_usage(const char *prog)
 {
 	fprintf(stderr, "Usage: %s [OPTIONS]\n", prog);
@@ -411,10 +563,15 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  -m, --mountpoint DIR   Mount after creating (required with -H)\n");
 	fprintf(stderr, "  -p, --phys ADDR        Write to physical address via /dev/mem\n");
 	fprintf(stderr, "  -s, --size SIZE        Size to allocate (required with -H or -p)\n");
+	fprintf(stderr, "  -w, --writable         Enable branching and mount read-write\n");
+	fprintf(stderr, "  -D, --delta SIZE       Delta region size (default: 64M, only with -w)\n");
 	fprintf(stderr, "  -h, --help             Show this help\n");
+	fprintf(stderr, "\nBy default, creates a static read-only image without branching support.\n");
+	fprintf(stderr, "Use -w to enable branching (adds branch table and delta region).\n");
 	fprintf(stderr, "\nExamples:\n");
 	fprintf(stderr, "  %s -d /path/to/rootfs -o image.daxfs\n", prog);
-	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/multikernel -s 256M -m /mnt\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -s 64M -m /mnt\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -s 256M -m /mnt -w\n", prog);
 	fprintf(stderr, "  %s -d /path/to/rootfs -p 0x100000000 -s 256M\n", prog);
 }
 
@@ -427,6 +584,8 @@ int main(int argc, char *argv[])
 		{"mountpoint", required_argument, 0, 'm'},
 		{"phys", required_argument, 0, 'p'},
 		{"size", required_argument, 0, 's'},
+		{"delta", required_argument, 0, 'D'},
+		{"writable", no_argument, 0, 'w'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
@@ -440,10 +599,13 @@ int main(int argc, char *argv[])
 	int dmabuf_fd = -1;
 	void *mem = NULL;
 	size_t total_size;
+	size_t base_size;
 	int opt;
 	int ret = 1;
+	size_t delta_size = DAXFS_DEFAULT_DELTA_SIZE;
+	bool writable = false;
 
-	while ((opt = getopt_long(argc, argv, "d:o:H:m:p:s:h", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:H:m:p:s:D:wh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			src_dir = optarg;
@@ -466,6 +628,16 @@ int main(int argc, char *argv[])
 				max_size *= 1024 * 1024;
 			else if (strchr(optarg, 'G') || strchr(optarg, 'g'))
 				max_size *= 1024 * 1024 * 1024;
+			break;
+		case 'D':
+			delta_size = strtoull(optarg, NULL, 0);
+			if (strchr(optarg, 'M') || strchr(optarg, 'm'))
+				delta_size *= 1024 * 1024;
+			else if (strchr(optarg, 'G') || strchr(optarg, 'g'))
+				delta_size *= 1024 * 1024 * 1024;
+			break;
+		case 'w':
+			writable = true;
 			break;
 		case 'h':
 		default:
@@ -507,9 +679,21 @@ int main(int argc, char *argv[])
 	build_tree();
 	calculate_offsets();
 
-	total_size = calculate_total_size();
+	base_size = calculate_base_size();
+	if (writable)
+		total_size = calculate_total_size(base_size, delta_size);
+	else
+		total_size = calculate_static_size(base_size);
+
+	printf("Base image size: %zu bytes (%.2f MB)\n", base_size,
+	       (double)base_size / (1024 * 1024));
+	if (writable) {
+		printf("Delta region size: %zu bytes (%.2f MB)\n", delta_size,
+		       (double)delta_size / (1024 * 1024));
+	}
 	printf("Total image size: %zu bytes (%.2f MB)\n", total_size,
 	       (double)total_size / (1024 * 1024));
+	printf("Mode: %s\n", writable ? "read-write (with branching)" : "read-only (static)");
 
 	if (heap_path) {
 		/* Allocate from DMA heap and write */
@@ -552,16 +736,26 @@ int main(int argc, char *argv[])
 		}
 
 		printf("Writing daxfs image...\n");
-		write_image(mem, max_size, src_dir);
-
-		struct daxfs_super *super = mem;
-		super->total_size = htole64(total_size);
+		if (writable) {
+			if (write_image(mem, max_size, src_dir, base_size, delta_size) < 0) {
+				munmap(mem, max_size);
+				close(dmabuf_fd);
+				return 1;
+			}
+		} else {
+			if (write_static_image(mem, max_size, src_dir, base_size) < 0) {
+				munmap(mem, max_size);
+				close(dmabuf_fd);
+				return 1;
+			}
+		}
 
 		munmap(mem, max_size);
 
 		/* Mount using the dma-buf fd via the new mount API */
-		printf("Mounting on %s...\n", mountpoint);
-		if (mount_daxfs_dmabuf(dmabuf_fd, mountpoint) < 0) {
+		printf("Mounting on %s (%s)...\n", mountpoint,
+		       writable ? "read-write" : "read-only");
+		if (mount_daxfs_dmabuf(dmabuf_fd, mountpoint, writable) < 0) {
 			close(dmabuf_fd);
 			return 1;
 		}
@@ -594,10 +788,17 @@ int main(int argc, char *argv[])
 		}
 
 		printf("Writing to physical address 0x%llx...\n", phys_addr);
-		write_image(mem, max_size, src_dir);
-
-		struct daxfs_super *super = mem;
-		super->total_size = htole64(total_size);
+		if (writable) {
+			if (write_image(mem, max_size, src_dir, base_size, delta_size) < 0) {
+				munmap(mem, max_size);
+				return 1;
+			}
+		} else {
+			if (write_static_image(mem, max_size, src_dir, base_size) < 0) {
+				munmap(mem, max_size);
+				return 1;
+			}
+		}
 
 		munmap(mem, max_size);
 		printf("Done\n");
@@ -627,10 +828,17 @@ int main(int argc, char *argv[])
 		}
 
 		printf("Writing to %s...\n", output_file);
-		write_image(mem, total_size, src_dir);
-
-		struct daxfs_super *super = mem;
-		super->total_size = htole64(total_size);
+		if (writable) {
+			if (write_image(mem, total_size, src_dir, base_size, delta_size) < 0) {
+				munmap(mem, total_size);
+				return 1;
+			}
+		} else {
+			if (write_static_image(mem, total_size, src_dir, base_size) < 0) {
+				munmap(mem, total_size);
+				return 1;
+			}
+		}
 
 		munmap(mem, total_size);
 		printf("Done\n");

@@ -21,6 +21,8 @@ struct inode *daxfs_alloc_inode(struct super_block *sb)
 
 	di->raw = NULL;
 	di->data_offset = 0;
+	di->delta_size = 0;
+	di->from_delta = false;
 
 	return &di->vfs_inode;
 }
@@ -37,17 +39,32 @@ static void daxfs_inode_init_once(void *obj)
 	inode_init_once(&di->vfs_inode);
 }
 
-struct inode *daxfs_iget(struct super_block *sb, u32 ino)
+/*
+ * Allocate a new inode number from the branch
+ */
+u64 daxfs_alloc_ino(struct daxfs_branch_ctx *branch)
+{
+	u64 ino;
+
+	ino = branch->next_ino++;
+	branch->on_dax->next_local_ino = cpu_to_le64(branch->next_ino);
+
+	return ino;
+}
+
+/*
+ * Get inode
+ */
+struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 {
 	struct daxfs_info *info = DAXFS_SB(sb);
-	struct daxfs_inode *raw;
 	struct daxfs_inode_info *di;
 	struct inode *inode;
 	struct timespec64 zerotime = {0, 0};
-	u32 mode;
-
-	if (ino == 0 || ino > le32_to_cpu(info->super->inode_count))
-		return ERR_PTR(-EINVAL);
+	umode_t mode = 0;
+	loff_t size = 0;
+	bool deleted = false;
+	int ret;
 
 	inode = iget_locked(sb, ino);
 	if (!inode)
@@ -56,17 +73,33 @@ struct inode *daxfs_iget(struct super_block *sb, u32 ino)
 	if (!(inode_state_read_once(inode) & I_NEW))
 		return inode;
 
-	raw = &info->inodes[ino - 1];
 	di = DAXFS_I(inode);
-	di->raw = raw;
-	di->data_offset = le64_to_cpu(raw->data_offset);
 
-	mode = le32_to_cpu(raw->mode);
+	/* First check delta logs */
+	ret = daxfs_resolve_inode(sb, ino, &mode, &size, &deleted);
+	if (ret == 0 && !deleted) {
+		/* Found in delta or base */
+		di->from_delta = true;
+		di->delta_size = size;
+	} else if (info->base_inodes && ino <= info->base_inode_count) {
+		/* Fall back to base image */
+		struct daxfs_base_inode *raw = &info->base_inodes[ino - 1];
+		di->raw = raw;
+		di->data_offset = le64_to_cpu(raw->data_offset);
+		mode = le32_to_cpu(raw->mode);
+		size = le64_to_cpu(raw->size);
+		di->from_delta = false;
+	} else {
+		/* Not found */
+		iget_failed(inode);
+		return ERR_PTR(-ENOENT);
+	}
+
 	inode->i_mode = mode;
-	inode->i_uid = make_kuid(&init_user_ns, le32_to_cpu(raw->uid));
-	inode->i_gid = make_kgid(&init_user_ns, le32_to_cpu(raw->gid));
-	inode->i_size = le64_to_cpu(raw->size);
-	set_nlink(inode, le32_to_cpu(raw->nlink));
+	inode->i_uid = GLOBAL_ROOT_UID;
+	inode->i_gid = GLOBAL_ROOT_GID;
+	inode->i_size = size;
+	set_nlink(inode, 1);
 
 	inode_set_mtime_to_ts(inode,
 		inode_set_atime_to_ts(inode,
@@ -84,13 +117,72 @@ struct inode *daxfs_iget(struct super_block *sb, u32 ino)
 		break;
 	case S_IFLNK:
 		inode->i_op = &simple_symlink_inode_operations;
-		inode->i_link = info->mem + di->data_offset;
+		/* TODO: handle symlinks in delta */
+		if (di->raw && !di->from_delta) {
+			/* Use storage layer for symlink target */
+			u64 symlink_offset = le64_to_cpu(info->super->base_offset) +
+					     di->data_offset;
+			inode->i_link = daxfs_mem_ptr(info, symlink_offset);
+		}
 		break;
 	default:
 		break;
 	}
 
 	unlock_new_inode(inode);
+	return inode;
+}
+
+/*
+ * Create a new inode
+ */
+struct inode *daxfs_new_inode(struct super_block *sb, umode_t mode, u64 ino)
+{
+	struct inode *inode;
+	struct daxfs_inode_info *di;
+	struct timespec64 now;
+
+	inode = new_inode(sb);
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	di = DAXFS_I(inode);
+	di->raw = NULL;
+	di->data_offset = 0;
+	di->delta_size = 0;
+	di->from_delta = true;
+
+	inode->i_ino = ino;
+	inode->i_mode = mode;
+	inode->i_uid = current_fsuid();
+	inode->i_gid = current_fsgid();
+	inode->i_size = 0;
+	set_nlink(inode, 1);
+
+	now = current_time(inode);
+	inode_set_mtime_to_ts(inode,
+		inode_set_atime_to_ts(inode,
+			inode_set_ctime_to_ts(inode, now)));
+
+	switch (mode & S_IFMT) {
+	case S_IFREG:
+		inode->i_op = &daxfs_file_inode_ops;
+		inode->i_fop = &daxfs_file_ops;
+		inode->i_mapping->a_ops = &daxfs_aops;
+		break;
+	case S_IFDIR:
+		inode->i_op = &daxfs_dir_inode_ops;
+		inode->i_fop = &daxfs_dir_ops;
+		inc_nlink(inode);	/* . entry */
+		break;
+	case S_IFLNK:
+		inode->i_op = &simple_symlink_inode_operations;
+		break;
+	default:
+		break;
+	}
+
+	insert_inode_hash(inode);
 	return inode;
 }
 
