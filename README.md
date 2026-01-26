@@ -45,7 +45,7 @@ useful beyond multikernel:
   means N copies of the same data in physical memory. Populating them also requires
   copying data in first, they cannot map an existing memory region in place.
 
--- **overlayfs** - A union filesystem that layers a writable upper directory over a
+- **overlayfs** - A union filesystem that layers a writable upper directory over a
   read-only lower. The main limitation is no nested branching — you cannot branch
   from a branch without stacking overlays, which has depth limits and complexity.
   daxfs branches can have parent branches, enabling arbitrary nesting. overlayfs
