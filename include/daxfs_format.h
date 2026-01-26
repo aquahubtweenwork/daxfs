@@ -189,7 +189,7 @@ struct daxfs_base_super {
 	__le64 strtab_offset;	/* Offset to string table (relative to base) */
 	__le64 strtab_size;	/* Size of string table */
 	__le64 data_offset;	/* Offset to file data area (relative to base) */
-	__u8   reserved[4024];	/* Pad to 4KB */
+	__u8   reserved[4032];	/* Pad to 4KB */
 };
 
 /*
