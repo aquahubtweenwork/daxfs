@@ -107,6 +107,169 @@ static int daxfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	return 0;
 }
 
+/*
+ * Validate the base image structure for security
+ * Returns 0 on success, -errno on error
+ */
+int daxfs_validate_base_image(struct daxfs_info *info)
+{
+	struct daxfs_base_super *base = info->base_super;
+	u64 base_offset = le64_to_cpu(info->super->base_offset);
+	u64 base_size = le64_to_cpu(info->super->base_size);
+	u64 inode_offset, strtab_offset, data_offset;
+	u64 strtab_size;
+	u32 inode_count, i;
+
+	if (!base)
+		return 0;  /* No base image */
+
+	/* Validate base image magic */
+	if (le32_to_cpu(base->magic) != DAXFS_BASE_MAGIC) {
+		pr_err("daxfs: invalid base image magic 0x%x\n",
+		       le32_to_cpu(base->magic));
+		return -EINVAL;
+	}
+
+	/* Validate base image fits within declared size */
+	if (le64_to_cpu(base->total_size) > base_size) {
+		pr_err("daxfs: base image total_size exceeds allocated space\n");
+		return -EINVAL;
+	}
+
+	inode_offset = le64_to_cpu(base->inode_offset);
+	strtab_offset = le64_to_cpu(base->strtab_offset);
+	strtab_size = le64_to_cpu(base->strtab_size);
+	data_offset = le64_to_cpu(base->data_offset);
+	inode_count = le32_to_cpu(base->inode_count);
+
+	/* Validate inode table bounds */
+	if (inode_offset > base_size ||
+	    (u64)inode_count * DAXFS_INODE_SIZE > base_size - inode_offset) {
+		pr_err("daxfs: inode table exceeds base image bounds\n");
+		return -EINVAL;
+	}
+
+	/* Validate string table bounds */
+	if (strtab_offset > base_size || strtab_size > base_size - strtab_offset) {
+		pr_err("daxfs: string table exceeds base image bounds\n");
+		return -EINVAL;
+	}
+
+	/* Validate root inode exists */
+	if (le32_to_cpu(base->root_inode) < 1 ||
+	    le32_to_cpu(base->root_inode) > inode_count) {
+		pr_err("daxfs: invalid root inode number\n");
+		return -EINVAL;
+	}
+
+	/* Validate each inode's offsets and references */
+	for (i = 0; i < inode_count; i++) {
+		struct daxfs_base_inode *raw = &info->base_inodes[i];
+		u32 name_offset = le32_to_cpu(raw->name_offset);
+		u32 name_len = le32_to_cpu(raw->name_len);
+		u64 file_data_offset = le64_to_cpu(raw->data_offset);
+		u64 file_size = le64_to_cpu(raw->size);
+		u32 first_child = le32_to_cpu(raw->first_child);
+		u32 next_sibling = le32_to_cpu(raw->next_sibling);
+		u32 parent_ino = le32_to_cpu(raw->parent_ino);
+		u32 mode = le32_to_cpu(raw->mode);
+
+		/* Validate string table reference */
+		if (!daxfs_valid_strtab(info, name_offset, name_len)) {
+			pr_err("daxfs: inode %u has invalid name reference\n", i + 1);
+			return -EINVAL;
+		}
+
+		/* Validate data offset for files and symlinks */
+		if (S_ISREG(mode) || S_ISLNK(mode)) {
+			if (!daxfs_valid_base_offset(info, file_data_offset, file_size)) {
+				pr_err("daxfs: inode %u has invalid data offset\n", i + 1);
+				return -EINVAL;
+			}
+		}
+
+		/* Validate directory child/sibling references */
+		if (first_child != 0 && first_child > inode_count) {
+			pr_err("daxfs: inode %u has invalid first_child\n", i + 1);
+			return -EINVAL;
+		}
+		if (next_sibling != 0 && next_sibling > inode_count) {
+			pr_err("daxfs: inode %u has invalid next_sibling\n", i + 1);
+			return -EINVAL;
+		}
+		if (parent_ino != 0 && parent_ino > inode_count) {
+			pr_err("daxfs: inode %u has invalid parent_ino\n", i + 1);
+			return -EINVAL;
+		}
+
+		/*
+		 * Ensure symlink targets are null-terminated.
+		 * The size field is the string length (without null), so the null
+		 * should be at position file_size. We check file_size + 1 bytes
+		 * to allow for the null terminator, but verify the offset is valid.
+		 */
+		if (S_ISLNK(mode) && file_size > 0) {
+			char *target = daxfs_mem_ptr(info,
+				base_offset + file_data_offset);
+			size_t check_len = file_size + 1;
+
+			/* Ensure we have space to check for null terminator */
+			if (!daxfs_valid_base_offset(info, file_data_offset, check_len)) {
+				pr_err("daxfs: inode %u symlink extends past bounds\n", i + 1);
+				return -EINVAL;
+			}
+
+			/* Check that there's a null at or before position file_size */
+			if (strnlen(target, check_len) > file_size) {
+				pr_err("daxfs: inode %u symlink not null-terminated\n", i + 1);
+				return -EINVAL;
+			}
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Validate overall image structure bounds
+ */
+static int daxfs_validate_super(struct daxfs_info *info)
+{
+	u64 base_offset = le64_to_cpu(info->super->base_offset);
+	u64 base_size = le64_to_cpu(info->super->base_size);
+	u64 branch_table_offset = le64_to_cpu(info->super->branch_table_offset);
+	u64 branch_table_size = (u64)info->branch_table_entries *
+				sizeof(struct daxfs_branch);
+	u64 delta_offset = le64_to_cpu(info->super->delta_region_offset);
+	u64 delta_size = le64_to_cpu(info->super->delta_region_size);
+
+	/* Validate base image region bounds */
+	if (base_offset != 0) {
+		if (!daxfs_valid_offset(info, base_offset, base_size)) {
+			pr_err("daxfs: base image region exceeds image bounds\n");
+			return -EINVAL;
+		}
+	}
+
+	/* Validate branch table bounds */
+	if (branch_table_offset != 0) {
+		if (!daxfs_valid_offset(info, branch_table_offset, branch_table_size)) {
+			pr_err("daxfs: branch table exceeds image bounds\n");
+			return -EINVAL;
+		}
+	}
+
+	/* Validate delta region bounds */
+	if (delta_offset != 0) {
+		if (!daxfs_valid_offset(info, delta_offset, delta_size)) {
+			pr_err("daxfs: delta region exceeds image bounds\n");
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct daxfs_fs_context *ctx = fc->fs_private;
@@ -176,6 +339,11 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	mutex_init(&info->branch_lock);
 	INIT_LIST_HEAD(&info->active_branches);
 
+	/* Validate overall image structure bounds */
+	ret = daxfs_validate_super(info);
+	if (ret)
+		goto err_unmap;
+
 	/* Load base image if present */
 	if (le64_to_cpu(info->super->base_offset)) {
 		u64 base_off = le64_to_cpu(info->super->base_offset);
@@ -187,6 +355,11 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 			base_off + le64_to_cpu(info->base_super->strtab_offset));
 		info->base_inode_count =
 			le32_to_cpu(info->base_super->inode_count);
+
+		/* Validate base image structure */
+		ret = daxfs_validate_base_image(info);
+		if (ret)
+			goto err_unmap;
 	}
 
 	sb->s_op = &daxfs_super_ops;

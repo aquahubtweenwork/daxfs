@@ -260,4 +260,63 @@ extern u64 daxfs_mem_alloc_region(struct daxfs_info *info, size_t size);
 extern void daxfs_mem_free_region(struct daxfs_info *info, u64 offset,
 				  u64 size);
 
+/*
+ * ============================================================================
+ * Validation Helpers
+ * ============================================================================
+ */
+
+/* Check if an inode number is valid for the base image */
+static inline bool daxfs_valid_base_ino(struct daxfs_info *info, u64 ino)
+{
+	return ino >= 1 && ino <= info->base_inode_count;
+}
+
+/* Check if an offset is within the mapped memory region */
+static inline bool daxfs_valid_offset(struct daxfs_info *info, u64 offset,
+				      size_t len)
+{
+	/* Check for overflow */
+	if (offset > SIZE_MAX - len)
+		return false;
+	return offset + len <= info->size;
+}
+
+/* Check if an offset is within the base image region */
+static inline bool daxfs_valid_base_offset(struct daxfs_info *info,
+					   u64 offset, size_t len)
+{
+	u64 base_size;
+
+	if (!info->base_super)
+		return false;
+
+	base_size = le64_to_cpu(info->base_super->total_size);
+
+	/* Check for overflow */
+	if (offset > SIZE_MAX - len)
+		return false;
+	return offset + len <= base_size;
+}
+
+/* Check if a string table access is valid */
+static inline bool daxfs_valid_strtab(struct daxfs_info *info,
+				      u32 name_offset, u32 name_len)
+{
+	u64 strtab_size;
+
+	if (!info->base_super)
+		return false;
+
+	strtab_size = le64_to_cpu(info->base_super->strtab_size);
+
+	/* Check for overflow */
+	if ((u64)name_offset + name_len > strtab_size)
+		return false;
+	return true;
+}
+
+/* Validate base image on mount - returns 0 on success, -errno on error */
+extern int daxfs_validate_base_image(struct daxfs_info *info);
+
 #endif /* _FS_DAXFS_H */

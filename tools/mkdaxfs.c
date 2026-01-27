@@ -306,6 +306,9 @@ static int write_base_image(void *mem, size_t mem_size, const char *src_dir)
 			n = readlink(fullpath, mem + e->data_offset, e->st.st_size);
 			if (n < 0)
 				perror(fullpath);
+			else
+				/* Ensure null-termination for kernel safety */
+				((char *)(mem + e->data_offset))[n] = '\0';
 		}
 	}
 

@@ -397,16 +397,136 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 }
 
 /*
+ * Validate a delta log entry header and return minimum required size
+ * Returns 0 if invalid, otherwise the minimum entry size for this type
+ */
+static size_t daxfs_delta_entry_min_size(u32 type)
+{
+	switch (type) {
+	case DAXFS_DELTA_WRITE:
+		return sizeof(struct daxfs_delta_hdr) +
+		       sizeof(struct daxfs_delta_write);
+	case DAXFS_DELTA_CREATE:
+	case DAXFS_DELTA_MKDIR:
+		return sizeof(struct daxfs_delta_hdr) +
+		       sizeof(struct daxfs_delta_create);
+	case DAXFS_DELTA_DELETE:
+		return sizeof(struct daxfs_delta_hdr) +
+		       sizeof(struct daxfs_delta_delete);
+	case DAXFS_DELTA_TRUNCATE:
+		return sizeof(struct daxfs_delta_hdr) +
+		       sizeof(struct daxfs_delta_truncate);
+	case DAXFS_DELTA_RENAME:
+		return sizeof(struct daxfs_delta_hdr) +
+		       sizeof(struct daxfs_delta_rename);
+	case DAXFS_DELTA_SETATTR:
+		return sizeof(struct daxfs_delta_hdr) +
+		       sizeof(struct daxfs_delta_setattr);
+	default:
+		return 0;  /* Unknown type */
+	}
+}
+
+/*
+ * Validate a delta log entry
+ * Returns 0 on success, -errno on error
+ */
+static int daxfs_validate_delta_entry(struct daxfs_branch_ctx *branch,
+				      u64 offset, struct daxfs_delta_hdr *hdr)
+{
+	u32 type = le32_to_cpu(hdr->type);
+	u32 total_size = le32_to_cpu(hdr->total_size);
+	size_t min_size;
+
+	/* Validate total_size is at least header size */
+	if (total_size < sizeof(struct daxfs_delta_hdr)) {
+		pr_err("daxfs: delta entry at offset %llu has invalid size %u\n",
+		       offset, total_size);
+		return -EINVAL;
+	}
+
+	/* Validate entry doesn't overflow the log */
+	if (offset + total_size > branch->delta_capacity) {
+		pr_err("daxfs: delta entry at offset %llu exceeds log capacity\n",
+		       offset);
+		return -EINVAL;
+	}
+
+	/* Validate minimum size for this entry type */
+	min_size = daxfs_delta_entry_min_size(type);
+	if (min_size == 0) {
+		pr_err("daxfs: delta entry at offset %llu has unknown type %u\n",
+		       offset, type);
+		return -EINVAL;
+	}
+
+	if (total_size < min_size) {
+		pr_err("daxfs: delta entry at offset %llu too small for type %u\n",
+		       offset, type);
+		return -EINVAL;
+	}
+
+	/* Type-specific validation */
+	switch (type) {
+	case DAXFS_DELTA_WRITE: {
+		struct daxfs_delta_write *wr = (void *)hdr + sizeof(*hdr);
+		u32 data_len = le32_to_cpu(wr->len);
+
+		if (total_size < min_size + data_len) {
+			pr_err("daxfs: WRITE entry at offset %llu truncated\n", offset);
+			return -EINVAL;
+		}
+		break;
+	}
+	case DAXFS_DELTA_CREATE:
+	case DAXFS_DELTA_MKDIR: {
+		struct daxfs_delta_create *cr = (void *)hdr + sizeof(*hdr);
+		u16 name_len = le16_to_cpu(cr->name_len);
+
+		if (total_size < min_size + name_len) {
+			pr_err("daxfs: CREATE/MKDIR entry at offset %llu truncated\n", offset);
+			return -EINVAL;
+		}
+		break;
+	}
+	case DAXFS_DELTA_DELETE: {
+		struct daxfs_delta_delete *del = (void *)hdr + sizeof(*hdr);
+		u16 name_len = le16_to_cpu(del->name_len);
+
+		if (total_size < min_size + name_len) {
+			pr_err("daxfs: DELETE entry at offset %llu truncated\n", offset);
+			return -EINVAL;
+		}
+		break;
+	}
+	case DAXFS_DELTA_RENAME: {
+		struct daxfs_delta_rename *rn = (void *)hdr + sizeof(*hdr);
+		u16 old_name_len = le16_to_cpu(rn->old_name_len);
+		u16 new_name_len = le16_to_cpu(rn->new_name_len);
+
+		if (total_size < min_size + old_name_len + new_name_len) {
+			pr_err("daxfs: RENAME entry at offset %llu truncated\n", offset);
+			return -EINVAL;
+		}
+		break;
+	}
+	}
+
+	return 0;
+}
+
+/*
  * Scan delta log and build in-memory index
  */
 int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 {
 	struct daxfs_delta_hdr *hdr;
 	u64 offset = 0;
+	int ret;
 
 	/* First, build parent's index if needed */
 	if (branch->parent && rb_first(&branch->parent->inode_index) == NULL) {
-		int ret = daxfs_delta_build_index(branch->parent);
+		ret = daxfs_delta_build_index(branch->parent);
 		if (ret)
 			return ret;
 	}
@@ -419,8 +539,13 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 		type = le32_to_cpu(hdr->type);
 		total_size = le32_to_cpu(hdr->total_size);
 
-		if (total_size == 0 || offset + total_size > branch->delta_size)
+		if (total_size == 0)
 			break;
+
+		/* Validate entry before processing */
+		ret = daxfs_validate_delta_entry(branch, offset, hdr);
+		if (ret)
+			return ret;
 
 		/* Index this entry based on type */
 		switch (type) {
