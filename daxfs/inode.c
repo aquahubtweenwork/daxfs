@@ -142,9 +142,18 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 			break;
 		case S_IFLNK:
 			inode->i_op = &simple_symlink_inode_operations;
-			/* TODO: handle symlinks in delta */
-			if (di->raw && !di->from_delta) {
-				/* Use storage layer for symlink target */
+			if (di->from_delta) {
+				/* Symlink created in delta - get target from index */
+				struct daxfs_branch_ctx *b;
+				for (b = info->current_branch; b; b = b->parent) {
+					char *target = daxfs_delta_get_symlink(b, ino);
+					if (target) {
+						inode->i_link = target;
+						break;
+					}
+				}
+			} else if (di->raw) {
+				/* Symlink from base image */
 				u64 symlink_offset = le64_to_cpu(info->super->base_offset) +
 						     di->data_offset;
 				inode->i_link = daxfs_mem_ptr(info, symlink_offset);

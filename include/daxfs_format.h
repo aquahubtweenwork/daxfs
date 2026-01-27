@@ -34,6 +34,7 @@
 #define DAXFS_DELTA_MKDIR	5	/* Create directory */
 #define DAXFS_DELTA_RENAME	6	/* Rename */
 #define DAXFS_DELTA_SETATTR	7	/* Inode metadata update */
+#define DAXFS_DELTA_SYMLINK	8	/* Create symlink */
 
 /*
  * Superblock - at offset 0, 4KB
@@ -162,6 +163,18 @@ struct daxfs_delta_setattr {
 #define DAXFS_ATTR_UID		(1 << 1)
 #define DAXFS_ATTR_GID		(1 << 2)
 #define DAXFS_ATTR_SIZE		(1 << 3)
+
+/*
+ * SYMLINK entry: header + this + name + target
+ */
+struct daxfs_delta_symlink {
+	__le64 parent_ino;
+	__le64 new_ino;
+	__le16 name_len;
+	__le16 target_len;
+	__le32 reserved;
+	/* Name follows immediately, then target (null-terminated) */
+};
 
 /*
  * ============================================================================

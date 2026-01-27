@@ -36,6 +36,14 @@ static bool daxfs_name_exists(struct super_block *sb, u64 parent_ino,
 					*ino_out = le64_to_cpu(cr->new_ino);
 				return true;
 			}
+
+			if (type == DAXFS_DELTA_SYMLINK) {
+				struct daxfs_delta_symlink *sl =
+					(void *)hdr + sizeof(*hdr);
+				if (ino_out)
+					*ino_out = le64_to_cpu(sl->new_ino);
+				return true;
+			}
 		}
 	}
 
@@ -243,6 +251,73 @@ static int daxfs_rmdir(struct inode *dir, struct dentry *dentry)
 	return daxfs_unlink(dir, dentry);
 }
 
+static int daxfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+			 struct dentry *dentry, const char *target)
+{
+	struct super_block *sb = dir->i_sb;
+	struct daxfs_info *info = DAXFS_SB(sb);
+	struct daxfs_branch_ctx *branch = info->current_branch;
+	struct inode *inode;
+	struct daxfs_delta_symlink sl;
+	char *entry_data;
+	size_t entry_size;
+	size_t target_len;
+	u64 new_ino;
+	int ret;
+
+	/* Check if name already exists */
+	if (daxfs_name_exists(sb, dir->i_ino,
+			      dentry->d_name.name, dentry->d_name.len, NULL))
+		return -EEXIST;
+
+	target_len = strlen(target);
+	if (target_len > PATH_MAX)
+		return -ENAMETOOLONG;
+
+	/* Allocate new inode number */
+	new_ino = daxfs_alloc_ino(branch);
+
+	/* Update global counter */
+	if (new_ino >= le64_to_cpu(info->super->next_inode_id))
+		info->super->next_inode_id = cpu_to_le64(new_ino + 1);
+
+	/* Prepare SYMLINK entry */
+	sl.parent_ino = cpu_to_le64(dir->i_ino);
+	sl.new_ino = cpu_to_le64(new_ino);
+	sl.name_len = cpu_to_le16(dentry->d_name.len);
+	sl.target_len = cpu_to_le16(target_len);
+	sl.reserved = 0;
+
+	/* Entry: struct + name + target + null terminator */
+	entry_size = sizeof(sl) + dentry->d_name.len + target_len + 1;
+	entry_data = kmalloc(entry_size, GFP_KERNEL);
+	if (!entry_data)
+		return -ENOMEM;
+
+	memcpy(entry_data, &sl, sizeof(sl));
+	memcpy(entry_data + sizeof(sl), dentry->d_name.name, dentry->d_name.len);
+	memcpy(entry_data + sizeof(sl) + dentry->d_name.len, target, target_len);
+	entry_data[sizeof(sl) + dentry->d_name.len + target_len] = '\0';
+
+	ret = daxfs_delta_append(branch, DAXFS_DELTA_SYMLINK, new_ino,
+				 entry_data, entry_size);
+	kfree(entry_data);
+	if (ret)
+		return ret;
+
+	/* Create VFS inode */
+	inode = daxfs_new_inode(sb, S_IFLNK | 0777, new_ino);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	/* Set symlink target - point directly to delta log */
+	inode->i_link = daxfs_delta_get_symlink(branch, new_ino);
+	inode->i_size = target_len;
+
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
 static int daxfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 			struct dentry *old_dentry, struct inode *new_dir,
 			struct dentry *new_dentry, unsigned int flags)
@@ -359,7 +434,7 @@ static int daxfs_iterate(struct file *file, struct dir_context *ctx)
 			if (total_size == 0)
 				break;
 
-			if ((type == DAXFS_DELTA_CREATE || type == DAXFS_DELTA_MKDIR)) {
+			if (type == DAXFS_DELTA_CREATE || type == DAXFS_DELTA_MKDIR) {
 				struct daxfs_delta_create *cr = (void *)hdr + sizeof(*hdr);
 
 				if (le64_to_cpu(cr->parent_ino) == dir->i_ino) {
@@ -397,6 +472,35 @@ static int daxfs_iterate(struct file *file, struct dir_context *ctx)
 				}
 			}
 
+			if (type == DAXFS_DELTA_SYMLINK) {
+				struct daxfs_delta_symlink *sl = (void *)hdr + sizeof(*hdr);
+
+				if (le64_to_cpu(sl->parent_ino) == dir->i_ino) {
+					char *name = (char *)(sl + 1);
+					u16 name_len = le16_to_cpu(sl->name_len);
+					u64 ino = le64_to_cpu(sl->new_ino);
+					bool deleted = false;
+
+					/* Check if subsequently deleted */
+					struct daxfs_branch_ctx *b2;
+					for (b2 = info->current_branch; b2 != branch; b2 = b2->parent) {
+						if (daxfs_delta_is_deleted(b2, ino)) {
+							deleted = true;
+							break;
+						}
+					}
+
+					if (!deleted) {
+						if (pos >= ctx->pos) {
+							if (!dir_emit(ctx, name, name_len, ino, DT_LNK))
+								return 0;
+							ctx->pos = pos + 1;
+						}
+						pos++;
+					}
+				}
+			}
+
 			offset += total_size;
 		}
 	}
@@ -411,6 +515,7 @@ const struct inode_operations daxfs_dir_inode_ops = {
 	.unlink		= daxfs_unlink,
 	.rmdir		= daxfs_rmdir,
 	.rename		= daxfs_rename,
+	.symlink	= daxfs_symlink,
 };
 
 const struct file_operations daxfs_dir_ops = {
