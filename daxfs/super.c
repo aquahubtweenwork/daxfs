@@ -108,6 +108,52 @@ static int daxfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 }
 
 /*
+ * Validate directory structure for cycles
+ * Returns 0 on success, -ELOOP if cycle detected
+ */
+static int daxfs_validate_dir_structure(struct daxfs_info *info)
+{
+	u32 inode_count = info->base_inode_count;
+	u32 i;
+
+	/*
+	 * For each directory, walk its children via first_child/next_sibling.
+	 * If we visit more inodes than exist, there's a cycle.
+	 */
+	for (i = 0; i < inode_count; i++) {
+		struct daxfs_base_inode *dir = &info->base_inodes[i];
+		u32 mode = le32_to_cpu(dir->mode);
+		u32 child_ino, visited;
+
+		if (!S_ISDIR(mode))
+			continue;
+
+		child_ino = le32_to_cpu(dir->first_child);
+		visited = 0;
+
+		while (child_ino != 0) {
+			struct daxfs_base_inode *child;
+
+			if (child_ino > inode_count) {
+				/* Already caught by bounds check, but be safe */
+				return -EINVAL;
+			}
+
+			visited++;
+			if (visited > inode_count) {
+				pr_err("daxfs: cycle detected in directory %u\n", i + 1);
+				return -ELOOP;
+			}
+
+			child = &info->base_inodes[child_ino - 1];
+			child_ino = le32_to_cpu(child->next_sibling);
+		}
+	}
+
+	return 0;
+}
+
+/*
  * Validate the base image structure for security
  * Returns 0 on success, -errno on error
  */
@@ -119,6 +165,7 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 	u64 inode_offset, strtab_offset, data_offset;
 	u64 strtab_size;
 	u32 inode_count, i;
+	int ret;
 
 	if (!base)
 		return 0;  /* No base image */
@@ -226,6 +273,11 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 			}
 		}
 	}
+
+	/* Validate directory structure for cycles */
+	ret = daxfs_validate_dir_structure(info);
+	if (ret)
+		return ret;
 
 	return 0;
 }
