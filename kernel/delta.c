@@ -42,7 +42,16 @@ static void free_inode_index(struct daxfs_branch_ctx *branch)
 	struct daxfs_delta_inode_entry *entry;
 
 	while ((node = rb_first(&branch->inode_index)) != NULL) {
+		struct daxfs_write_extent *extent, *tmp;
+
 		entry = rb_entry(node, struct daxfs_delta_inode_entry, rb_node);
+
+		/* Free all write extents for this inode */
+		list_for_each_entry_safe(extent, tmp, &entry->write_extents, list) {
+			list_del(&extent->list);
+			kfree(extent);
+		}
+
 		rb_erase(node, &branch->inode_index);
 		kfree(entry);
 	}
@@ -149,9 +158,67 @@ static int index_add_inode(struct daxfs_branch_ctx *branch, u64 ino,
 	entry->deleted = deleted;
 	entry->size = (size != (u64)-1) ? size : 0;
 	entry->mode = (mode != (u32)-1) ? mode : 0;
+	INIT_LIST_HEAD(&entry->write_extents);
 
 	rb_link_node(&entry->rb_node, parent, link);
 	rb_insert_color(&entry->rb_node, &branch->inode_index);
+
+	spin_unlock_irqrestore(&branch->index_lock, flags);
+	return 0;
+}
+
+/*
+ * Find inode entry in index (caller must hold index_lock)
+ */
+static struct daxfs_delta_inode_entry *find_inode_entry_locked(
+	struct daxfs_branch_ctx *branch, u64 ino)
+{
+	struct rb_node *node = branch->inode_index.rb_node;
+
+	while (node) {
+		struct daxfs_delta_inode_entry *entry =
+			rb_entry(node, struct daxfs_delta_inode_entry, rb_node);
+
+		if (ino < entry->ino)
+			node = node->rb_left;
+		else if (ino > entry->ino)
+			node = node->rb_right;
+		else
+			return entry;
+	}
+	return NULL;
+}
+
+/*
+ * Add a write extent to an inode's extent list
+ * Prepends to list so newest writes are first (for fast lookup)
+ */
+int daxfs_index_add_write_extent(struct daxfs_branch_ctx *branch, u64 ino,
+				 u64 offset, u32 len, void *data)
+{
+	struct daxfs_delta_inode_entry *ie;
+	struct daxfs_write_extent *extent;
+	unsigned long flags;
+
+	extent = kzalloc(sizeof(*extent), GFP_ATOMIC);
+	if (!extent)
+		return -ENOMEM;
+
+	extent->offset = offset;
+	extent->len = len;
+	extent->data = data;
+
+	spin_lock_irqsave(&branch->index_lock, flags);
+
+	ie = find_inode_entry_locked(branch, ino);
+	if (!ie) {
+		spin_unlock_irqrestore(&branch->index_lock, flags);
+		kfree(extent);
+		return -ENOENT;
+	}
+
+	/* Prepend - newest writes first for fast lookup */
+	list_add(&extent->list, &ie->write_extents);
 
 	spin_unlock_irqrestore(&branch->index_lock, flags);
 	return 0;
@@ -287,12 +354,15 @@ int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 	}
 	case DAXFS_DELTA_WRITE: {
 		struct daxfs_delta_write *wr = entry + sizeof(*hdr);
-		u64 offset = le64_to_cpu(wr->offset);
-		u32 len = le32_to_cpu(wr->len);
-		u64 end = offset + len;
+		u64 wr_offset = le64_to_cpu(wr->offset);
+		u32 wr_len = le32_to_cpu(wr->len);
+		u64 end = wr_offset + wr_len;
+		void *wr_data = (void *)(wr + 1);
 
 		/* Update size if write extends file */
 		index_add_inode(branch, ino, hdr, false, end, -1);
+		/* Add write extent for fast data lookup */
+		daxfs_index_add_write_extent(branch, ino, wr_offset, wr_len, wr_data);
 		break;
 	}
 	case DAXFS_DELTA_SETATTR: {
@@ -390,10 +460,16 @@ int daxfs_delta_build_index(struct daxfs_branch_ctx *branch)
 		case DAXFS_DELTA_WRITE: {
 			struct daxfs_delta_write *wr =
 				(void *)hdr + sizeof(*hdr);
-			u64 end = le64_to_cpu(wr->offset) + le32_to_cpu(wr->len);
+			u64 wr_offset = le64_to_cpu(wr->offset);
+			u32 wr_len = le32_to_cpu(wr->len);
+			u64 end = wr_offset + wr_len;
+			void *wr_data = (void *)(wr + 1);
 
 			index_add_inode(branch, le64_to_cpu(hdr->ino), hdr,
 					false, end, -1);
+			/* Add write extent for fast data lookup */
+			daxfs_index_add_write_extent(branch, le64_to_cpu(hdr->ino),
+					       wr_offset, wr_len, wr_data);
 			break;
 		}
 		case DAXFS_DELTA_SETATTR: {
@@ -628,8 +704,52 @@ int daxfs_resolve_inode(struct super_block *sb, u64 ino,
 }
 
 /*
+ * Lookup write extent using the per-inode index
+ * Returns pointer to data and length, or NULL if not found
+ *
+ * Write extents are stored newest-first, so the first match is the latest.
+ */
+void *daxfs_lookup_write_extent(struct daxfs_branch_ctx *branch, u64 ino,
+				loff_t pos, size_t len, size_t *out_len)
+{
+	struct daxfs_delta_inode_entry *ie;
+	struct daxfs_write_extent *extent;
+	unsigned long flags;
+	void *result = NULL;
+
+	spin_lock_irqsave(&branch->index_lock, flags);
+
+	ie = find_inode_entry_locked(branch, ino);
+	if (!ie) {
+		spin_unlock_irqrestore(&branch->index_lock, flags);
+		return NULL;
+	}
+
+	/*
+	 * Walk write extents - they're stored newest-first,
+	 * so the first match is the latest write at this position.
+	 */
+	list_for_each_entry(extent, &ie->write_extents, list) {
+		if (pos >= extent->offset &&
+		    pos < extent->offset + extent->len) {
+			/* Found it */
+			u64 data_off = pos - extent->offset;
+			result = extent->data + data_off;
+			*out_len = min(len, (size_t)(extent->len - data_off));
+			break;
+		}
+	}
+
+	spin_unlock_irqrestore(&branch->index_lock, flags);
+	return result;
+}
+
+/*
  * Resolve file data through branch chain
  * Returns pointer to data and actual length available
+ *
+ * Uses per-inode write extent index for O(w) lookup where w is
+ * the number of writes to this inode, instead of O(n) full log scan.
  */
 void *daxfs_resolve_file_data(struct super_block *sb, u64 ino,
 			      loff_t pos, size_t len, size_t *out_len)
@@ -639,38 +759,9 @@ void *daxfs_resolve_file_data(struct super_block *sb, u64 ino,
 
 	/* Walk branch chain from child to parent looking for write at pos */
 	for (b = info->current_branch; b != NULL; b = b->parent) {
-		/* Scan delta log for WRITE entries covering this position */
-		u64 offset = 0;
-
-		while (offset < b->delta_size) {
-			struct daxfs_delta_hdr *hdr = b->delta_log + offset;
-			u32 type = le32_to_cpu(hdr->type);
-			u32 total_size = le32_to_cpu(hdr->total_size);
-
-			if (total_size == 0)
-				break;
-
-			if (type == DAXFS_DELTA_WRITE &&
-			    le64_to_cpu(hdr->ino) == ino) {
-				struct daxfs_delta_write *wr =
-					(void *)hdr + sizeof(*hdr);
-				u64 wr_offset = le64_to_cpu(wr->offset);
-				u32 wr_len = le32_to_cpu(wr->len);
-
-				if (pos >= wr_offset &&
-				    pos < wr_offset + wr_len) {
-					/* Found data at this position */
-					u64 data_off = pos - wr_offset;
-					void *data = (void *)(wr + 1) + data_off;
-					size_t avail = wr_len - data_off;
-
-					*out_len = min(len, avail);
-					return data;
-				}
-			}
-
-			offset += total_size;
-		}
+		void *data = daxfs_lookup_write_extent(b, ino, pos, len, out_len);
+		if (data)
+			return data;
 	}
 
 	/* Fall back to base image using storage layer */

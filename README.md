@@ -128,9 +128,8 @@ EROFS attractive.
 # Mount with a writable branch
 mount -t daxfs -o phys=0x100000000,size=0x10000000,branch=main,rw none /mnt
 
-# Create and switch to a new branch
+# Create a new branch (implicitly switches to it)
 daxfs-branch create feature -m /mnt -p main
-daxfs-branch switch feature -m /mnt
 
 # List branches
 daxfs-branch list -m /mnt
@@ -142,11 +141,10 @@ daxfs-branch abort -m /mnt
 
 ### Branch operations
 
-- **create** — Create a new branch from a parent branch
-- **switch** — Switch the mount to a different branch
+- **create** — Create a new branch from a parent branch (implicitly switches to it)
 - **list** — List all branches and their states
-- **commit** — Make current branch permanent, discard all sibling branches
-- **abort** — Discard current branch, switch back to root
+- **commit** — Make current branch permanent, discard all sibling branches (switches to main)
+- **abort** — Discard current branch (switches to main)
 
 ### Delta log
 

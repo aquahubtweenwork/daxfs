@@ -26,6 +26,17 @@ static inline unsigned int inode_state_read_once(struct inode *inode)
 struct daxfs_branch_ctx;
 
 /*
+ * Write extent entry - tracks a single write to an inode
+ * Stored in a list per inode, newest first for fast lookup
+ */
+struct daxfs_write_extent {
+	struct list_head list;
+	u64 offset;			/* File offset of write */
+	u32 len;			/* Length of write */
+	void *data;			/* Pointer to data in delta log */
+};
+
+/*
  * Delta index entry - tracks latest delta for an inode
  */
 struct daxfs_delta_inode_entry {
@@ -35,6 +46,7 @@ struct daxfs_delta_inode_entry {
 	u64 size;			/* Current size after all deltas */
 	u32 mode;			/* Current mode */
 	bool deleted;			/* Tombstone marker */
+	struct list_head write_extents;	/* List of writes, newest first */
 };
 
 /*
@@ -114,6 +126,9 @@ struct daxfs_info {
 	/* Branch management */
 	struct mutex branch_lock;
 	struct list_head active_branches;
+
+	/* Open file tracking for mmap safety */
+	atomic_t open_files;		/* Count of open regular files */
 };
 
 struct daxfs_inode_info {
@@ -183,6 +198,12 @@ extern int daxfs_resolve_inode(struct super_block *sb, u64 ino,
 			       umode_t *mode, loff_t *size, bool *deleted);
 extern void *daxfs_resolve_file_data(struct super_block *sb, u64 ino,
 				     loff_t pos, size_t len, size_t *out_len);
+extern void *daxfs_lookup_write_extent(struct daxfs_branch_ctx *branch,
+				       u64 ino, loff_t pos, size_t len,
+				       size_t *out_len);
+extern int daxfs_index_add_write_extent(struct daxfs_branch_ctx *branch,
+					u64 ino, u64 offset, u32 len,
+					void *data);
 extern int daxfs_delta_merge(struct daxfs_branch_ctx *parent,
 			     struct daxfs_branch_ctx *child);
 

@@ -10,6 +10,7 @@
 #include <linux/uio.h>
 #include <linux/pagemap.h>
 #include <linux/highmem.h>
+#include <linux/writeback.h>
 #include "daxfs.h"
 
 static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
@@ -119,7 +120,7 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 				if (pos + len > ie->size)
 					ie->size = pos + len;
 				spin_unlock_irqrestore(&branch->index_lock, flags);
-				goto done;
+				goto add_extent;
 			}
 		}
 
@@ -130,13 +131,25 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			ie->size = pos + len;
 			ie->mode = inode->i_mode;
 			ie->deleted = false;
+			INIT_LIST_HEAD(&ie->write_extents);
 			rb_link_node(&ie->rb_node, parent, link);
 			rb_insert_color(&ie->rb_node, &branch->inode_index);
 		}
 		spin_unlock_irqrestore(&branch->index_lock, flags);
 	}
 
-done:
+add_extent:
+	/* Add write extent for fast data lookup */
+	daxfs_index_add_write_extent(branch, inode->i_ino, pos, len, data);
+
+	/*
+	 * Invalidate page cache for the written range. This ensures mmap
+	 * readers see the new data from the delta log, not stale cached pages.
+	 */
+	invalidate_inode_pages2_range(inode->i_mapping,
+				      pos >> PAGE_SHIFT,
+				      (pos + len - 1) >> PAGE_SHIFT);
+
 	iocb->ki_pos = pos + len;
 	inode_set_mtime_to_ts(inode, inode_set_ctime_to_ts(inode, current_time(inode)));
 	return len;
@@ -234,15 +247,193 @@ out:
 	return 0;
 }
 
+static int daxfs_write_folio(struct folio *folio, struct writeback_control *wbc)
+{
+	struct inode *inode = folio->mapping->host;
+	struct super_block *sb = inode->i_sb;
+	struct daxfs_info *info = DAXFS_SB(sb);
+	struct daxfs_branch_ctx *branch = info->current_branch;
+	loff_t pos = folio_pos(folio);
+	size_t len = folio_size(folio);
+	size_t entry_size;
+	void *entry;
+	struct daxfs_delta_hdr *hdr;
+	struct daxfs_delta_write *wr;
+	void *data;
+
+	/* Don't write beyond file size */
+	if (pos >= inode->i_size) {
+		folio_start_writeback(folio);
+		folio_unlock(folio);
+		folio_end_writeback(folio);
+		return 0;
+	}
+
+	if (pos + len > inode->i_size)
+		len = inode->i_size - pos;
+
+	/* Allocate space for delta entry */
+	entry_size = sizeof(struct daxfs_delta_hdr) +
+		     sizeof(struct daxfs_delta_write) + len;
+
+	entry = daxfs_delta_alloc(info, branch, entry_size);
+	if (!entry) {
+		folio_redirty_for_writepage(wbc, folio);
+		folio_unlock(folio);
+		return -ENOSPC;
+	}
+
+	/* Fill header */
+	hdr = entry;
+	hdr->type = cpu_to_le32(DAXFS_DELTA_WRITE);
+	hdr->total_size = cpu_to_le32(entry_size);
+	hdr->ino = cpu_to_le64(inode->i_ino);
+	hdr->timestamp = cpu_to_le64(ktime_get_real_ns());
+
+	/* Fill write info */
+	wr = (void *)(hdr + 1);
+	wr->offset = cpu_to_le64(pos);
+	wr->len = cpu_to_le32(len);
+	wr->flags = 0;
+
+	/* Copy folio data while still locked */
+	data = (void *)(wr + 1);
+	memcpy_from_folio(data, folio, 0, len);
+
+	/* Start writeback and unlock - data copy is complete */
+	folio_start_writeback(folio);
+	folio_unlock(folio);
+
+	/* Update index */
+	{
+		struct rb_node **link = &branch->inode_index.rb_node;
+		struct rb_node *parent = NULL;
+		struct daxfs_delta_inode_entry *ie;
+		unsigned long flags;
+
+		spin_lock_irqsave(&branch->index_lock, flags);
+
+		while (*link) {
+			parent = *link;
+			ie = rb_entry(parent, struct daxfs_delta_inode_entry,
+				      rb_node);
+
+			if (inode->i_ino < ie->ino)
+				link = &parent->rb_left;
+			else if (inode->i_ino > ie->ino)
+				link = &parent->rb_right;
+			else {
+				/* Update existing */
+				ie->hdr = hdr;
+				if (pos + len > ie->size)
+					ie->size = pos + len;
+				spin_unlock_irqrestore(&branch->index_lock, flags);
+				goto add_extent;
+			}
+		}
+
+		ie = kzalloc(sizeof(*ie), GFP_ATOMIC);
+		if (ie) {
+			ie->ino = inode->i_ino;
+			ie->hdr = hdr;
+			ie->size = pos + len;
+			ie->mode = inode->i_mode;
+			ie->deleted = false;
+			INIT_LIST_HEAD(&ie->write_extents);
+			rb_link_node(&ie->rb_node, parent, link);
+			rb_insert_color(&ie->rb_node, &branch->inode_index);
+		}
+		spin_unlock_irqrestore(&branch->index_lock, flags);
+	}
+
+add_extent:
+	/* Add write extent for fast data lookup */
+	daxfs_index_add_write_extent(branch, inode->i_ino, pos, len, data);
+
+	folio_end_writeback(folio);
+	return 0;
+}
+
+static int daxfs_writepages(struct address_space *mapping,
+			    struct writeback_control *wbc)
+{
+	struct folio *folio = NULL;
+	int error = 0;
+
+	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
+		error = daxfs_write_folio(folio, wbc);
+
+	return error;
+}
+
 const struct address_space_operations daxfs_aops = {
 	.read_folio	= daxfs_read_folio,
+	.writepages	= daxfs_writepages,
+	.dirty_folio	= filemap_dirty_folio,
 };
+
+static int daxfs_file_open(struct inode *inode, struct file *file)
+{
+	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
+
+	if (S_ISREG(inode->i_mode))
+		atomic_inc(&info->open_files);
+	return 0;
+}
+
+static int daxfs_file_release(struct inode *inode, struct file *file)
+{
+	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
+
+	if (S_ISREG(inode->i_mode))
+		atomic_dec(&info->open_files);
+	return 0;
+}
+
+static vm_fault_t daxfs_page_mkwrite(struct vm_fault *vmf)
+{
+	struct folio *folio = page_folio(vmf->page);
+	struct inode *inode = file_inode(vmf->vma->vm_file);
+
+	if (inode->i_sb->s_flags & SB_RDONLY)
+		return VM_FAULT_SIGBUS;
+
+	sb_start_pagefault(inode->i_sb);
+	folio_lock(folio);
+	folio_mark_dirty(folio);
+	folio_wait_stable(folio);
+	sb_end_pagefault(inode->i_sb);
+
+	return VM_FAULT_LOCKED;
+}
+
+static const struct vm_operations_struct daxfs_vm_ops = {
+	.fault		= filemap_fault,
+	.map_pages	= filemap_map_pages,
+	.page_mkwrite	= daxfs_page_mkwrite,
+};
+
+static int daxfs_file_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct inode *inode = file_inode(file);
+
+	if ((vma->vm_flags & VM_WRITE) && (inode->i_sb->s_flags & SB_RDONLY))
+		return -EACCES;
+
+	file_accessed(file);
+	vma->vm_ops = &daxfs_vm_ops;
+	return 0;
+}
 
 const struct file_operations daxfs_file_ops = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= daxfs_read_iter,
 	.write_iter	= daxfs_write_iter,
 	.splice_read	= filemap_splice_read,
+	.open		= daxfs_file_open,
+	.release	= daxfs_file_release,
+	.mmap		= daxfs_file_mmap,
+	.fsync		= generic_file_fsync,
 };
 
 const struct inode_operations daxfs_file_inode_ops = {

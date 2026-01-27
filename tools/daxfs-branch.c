@@ -9,7 +9,6 @@
  * Usage:
  *   daxfs-branch list -m /mnt
  *   daxfs-branch create feature -m /mnt -p main
- *   daxfs-branch switch feature -m /mnt
  *   daxfs-branch commit -m /mnt
  *   daxfs-branch abort -m /mnt
  */
@@ -292,40 +291,6 @@ static int cmd_create(const char *mountpoint, const char *branch,
 	return 0;
 }
 
-static int cmd_switch(const char *mountpoint, const char *branch)
-{
-	struct mount_info mi = {0};
-	char options[512];
-	int ret;
-
-	if (!branch) {
-		fprintf(stderr, "Error: branch name required\n");
-		return 1;
-	}
-
-	if (find_daxfs_mount(mountpoint, &mi) < 0) {
-		fprintf(stderr, "Error: no daxfs mount at '%s'\n", mountpoint);
-		return 1;
-	}
-
-	printf("Switching to branch '%s'...\n", branch);
-
-	/* Use remount to switch branch (works for both phys and dmabuf) */
-	snprintf(options, sizeof(options), "remount,branch=%s", branch);
-
-	char *argv[] = {"mount", "-o", options, (char *)mountpoint, NULL};
-	ret = run_mount(argv);
-	if (ret < 0) {
-		fprintf(stderr, "Error: failed to switch to branch '%s'\n", branch);
-		free_mount_info(&mi);
-		return 1;
-	}
-
-	printf("Switched to branch '%s' at '%s'\n", branch, mountpoint);
-	free_mount_info(&mi);
-	return 0;
-}
-
 static int cmd_commit(const char *mountpoint)
 {
 	struct mount_info mi = {0};
@@ -402,7 +367,6 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "\nCommands:\n");
 	fprintf(stderr, "  list              List daxfs mounts or show mount info\n");
 	fprintf(stderr, "  create NAME       Create a new branch from parent\n");
-	fprintf(stderr, "  switch NAME       Switch to a different branch\n");
 	fprintf(stderr, "  commit            Commit current branch to parent\n");
 	fprintf(stderr, "  abort             Abort current branch (discard changes)\n");
 	fprintf(stderr, "\nOptions:\n");
@@ -413,7 +377,6 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  %s list\n", prog);
 	fprintf(stderr, "  %s list -m /mnt\n", prog);
 	fprintf(stderr, "  %s create feature -m /mnt -p main\n", prog);
-	fprintf(stderr, "  %s switch main -m /mnt\n", prog);
 	fprintf(stderr, "  %s commit -m /mnt\n", prog);
 	fprintf(stderr, "  %s abort -m /mnt\n", prog);
 	fprintf(stderr, "\nNote: Use 'daxfs-inspect' to inspect raw image files.\n");
@@ -475,12 +438,6 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 		ret = cmd_create(mountpoint, branch_name, parent);
-	} else if (strcmp(command, "switch") == 0) {
-		if (!mountpoint) {
-			fprintf(stderr, "Error: -m/--mount is required\n");
-			return 1;
-		}
-		ret = cmd_switch(mountpoint, branch_name);
 	} else if (strcmp(command, "commit") == 0) {
 		if (!mountpoint) {
 			fprintf(stderr, "Error: -m/--mount is required\n");

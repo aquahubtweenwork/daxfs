@@ -8,6 +8,7 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/writeback.h>
 #include "daxfs.h"
 
 #define INITIAL_DELTA_SIZE	(64 * 1024)	/* 64KB initial delta log */
@@ -272,6 +273,13 @@ int daxfs_branch_commit(struct daxfs_info *info,
 
 	mutex_lock(&info->branch_lock);
 
+	/* Check for open files (mmap safety) */
+	if (atomic_read(&info->open_files) > 0) {
+		mutex_unlock(&info->branch_lock);
+		pr_err("daxfs: cannot commit with open files\n");
+		return -EBUSY;
+	}
+
 	/* Can't commit main branch */
 	if (strcmp(branch->name, "main") == 0) {
 		mutex_unlock(&info->branch_lock);
@@ -330,6 +338,13 @@ int daxfs_branch_abort(struct daxfs_info *info,
 	struct daxfs_branch_ctx *parent;
 
 	mutex_lock(&info->branch_lock);
+
+	/* Check for open files (mmap safety) */
+	if (atomic_read(&info->open_files) > 0) {
+		mutex_unlock(&info->branch_lock);
+		pr_err("daxfs: cannot abort with open files\n");
+		return -EBUSY;
+	}
 
 	/* Can't abort main branch */
 	if (strcmp(branch->name, "main") == 0) {

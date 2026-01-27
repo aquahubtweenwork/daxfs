@@ -120,6 +120,8 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!info)
 		return -ENOMEM;
 
+	atomic_set(&info->open_files, 0);
+
 	/* Initialize memory mapping via storage layer */
 	if (ctx->dmabuf_file) {
 		ret = daxfs_mem_init_dmabuf(info, ctx->dmabuf_file);
@@ -347,6 +349,9 @@ static int daxfs_reconfigure(struct fs_context *fc)
 			return -EINVAL;
 		}
 
+		/* Sync all dirty pages before commit */
+		sync_filesystem(sb);
+
 		ret = daxfs_branch_commit(info, branch);
 		if (ret) {
 			pr_err("daxfs: commit failed: %d\n", ret);
@@ -372,9 +377,24 @@ static int daxfs_reconfigure(struct fs_context *fc)
 			return -EINVAL;
 		}
 
+		/*
+		 * Sync dirty pages before abort. Note: these writes go to
+		 * the current branch which we're about to discard. This
+		 * ensures the page cache is clean before we switch branches.
+		 */
+		sync_filesystem(sb);
+
 		/* Switch to main first */
 		atomic_inc(&main_branch->refcount);
 		info->current_branch = main_branch;
+
+		/*
+		 * Invalidate page cache - cached data is from the old branch.
+		 * Since EBUSY check passed, no files are open, so all inodes
+		 * can be evicted along with their cached pages.
+		 */
+		shrink_dcache_sb(sb);
+		evict_inodes(sb);
 
 		/* Now abort the old branch */
 		ret = daxfs_branch_abort(info, branch);
@@ -415,36 +435,6 @@ static int daxfs_reconfigure(struct fs_context *fc)
 		atomic_dec(&old_branch->refcount);
 
 		pr_info("daxfs: switched to new branch '%s'\n", ctx->branch_name);
-	} else if (ctx->branch_name) {
-		/* Switch to existing branch */
-		struct daxfs_branch_ctx *new_branch;
-		struct daxfs_branch_ctx *old_branch;
-
-		new_branch = daxfs_find_branch_by_name(info, ctx->branch_name);
-		if (!new_branch) {
-			pr_err("daxfs: branch '%s' not found\n", ctx->branch_name);
-			return -ENOENT;
-		}
-
-		if (new_branch == info->current_branch) {
-			/* Already on this branch */
-			return 0;
-		}
-
-		/* Build delta index for branch if needed */
-		ret = daxfs_delta_build_index(new_branch);
-		if (ret) {
-			pr_err("daxfs: delta index build failed: %d\n", ret);
-			return ret;
-		}
-
-		/* Switch branches */
-		old_branch = info->current_branch;
-		atomic_inc(&new_branch->refcount);
-		info->current_branch = new_branch;
-		atomic_dec(&old_branch->refcount);
-
-		pr_info("daxfs: switched to branch '%s'\n", ctx->branch_name);
 	}
 
 	return ret;
