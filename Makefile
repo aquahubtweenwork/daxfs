@@ -2,10 +2,10 @@
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
-all: kernel mkdaxfs tools
+all: daxfs mkdaxfs tools
 
-kernel:
-	$(MAKE) -C kernel KDIR=$(KDIR)
+daxfs:
+	$(MAKE) -C daxfs KDIR=$(KDIR)
 
 mkdaxfs:
 	$(MAKE) -C mkdaxfs
@@ -14,8 +14,8 @@ tools:
 	$(MAKE) -C tools
 
 clean:
-	$(MAKE) -C kernel clean
+	$(MAKE) -C daxfs clean
 	$(MAKE) -C mkdaxfs clean
 	$(MAKE) -C tools clean
 
-.PHONY: all kernel mkdaxfs tools clean
+.PHONY: all daxfs mkdaxfs tools clean
