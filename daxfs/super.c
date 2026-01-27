@@ -25,6 +25,7 @@ enum daxfs_param {
 	Opt_commit,
 	Opt_abort,
 	Opt_rw,
+	Opt_validate,
 };
 
 static const struct fs_parameter_spec daxfs_fs_parameters[] = {
@@ -37,6 +38,7 @@ static const struct fs_parameter_spec daxfs_fs_parameters[] = {
 	fsparam_flag("commit", Opt_commit),
 	fsparam_flag("abort", Opt_abort),
 	fsparam_flag("rw", Opt_rw),
+	fsparam_flag("validate", Opt_validate),
 	{}
 };
 
@@ -50,6 +52,7 @@ struct daxfs_fs_context {
 	bool commit;			/* remount commit flag */
 	bool do_abort;			/* remount abort flag */
 	bool writable;			/* mount read-write */
+	bool validate;			/* validate image on mount */
 };
 
 static int daxfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
@@ -100,6 +103,9 @@ static int daxfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_rw:
 		ctx->writable = true;
+		break;
+	case Opt_validate:
+		ctx->validate = true;
 		break;
 	default:
 		return -EINVAL;
@@ -391,10 +397,12 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	mutex_init(&info->branch_lock);
 	INIT_LIST_HEAD(&info->active_branches);
 
-	/* Validate overall image structure bounds */
-	ret = daxfs_validate_super(info);
-	if (ret)
-		goto err_unmap;
+	/* Validate overall image structure bounds (if requested) */
+	if (ctx->validate) {
+		ret = daxfs_validate_super(info);
+		if (ret)
+			goto err_unmap;
+	}
 
 	/* Load base image if present */
 	if (le64_to_cpu(info->super->base_offset)) {
@@ -408,10 +416,12 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		info->base_inode_count =
 			le32_to_cpu(info->base_super->inode_count);
 
-		/* Validate base image structure */
-		ret = daxfs_validate_base_image(info);
-		if (ret)
-			goto err_unmap;
+		/* Validate base image structure (if requested) */
+		if (ctx->validate) {
+			ret = daxfs_validate_base_image(info);
+			if (ret)
+				goto err_unmap;
+		}
 	}
 
 	sb->s_op = &daxfs_super_ops;

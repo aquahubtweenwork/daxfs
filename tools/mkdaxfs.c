@@ -375,7 +375,8 @@ static inline int sys_move_mount(int from_dfd, const char *from_path,
 /*
  * Mount a daxfs filesystem backed by a dma-buf fd using the new mount API.
  */
-static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint, bool writable)
+static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint,
+			      bool writable, bool validate)
 {
 	int fs_fd, mnt_fd;
 
@@ -394,6 +395,14 @@ static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint, bool writab
 	if (writable) {
 		if (sys_fsconfig(fs_fd, FSCONFIG_SET_FLAG, "rw", NULL, 0) < 0) {
 			perror("fsconfig(FSCONFIG_SET_FLAG, rw)");
+			close(fs_fd);
+			return -1;
+		}
+	}
+
+	if (validate) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_FLAG, "validate", NULL, 0) < 0) {
+			perror("fsconfig(FSCONFIG_SET_FLAG, validate)");
 			close(fs_fd);
 			return -1;
 		}
@@ -567,6 +576,7 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  -p, --phys ADDR        Write to physical address via /dev/mem\n");
 	fprintf(stderr, "  -s, --size SIZE        Size to allocate (required with -H or -p)\n");
 	fprintf(stderr, "  -w, --writable         Enable branching and mount read-write\n");
+	fprintf(stderr, "  -V, --validate         Validate image on mount\n");
 	fprintf(stderr, "  -D, --delta SIZE       Delta region size (default: 64M, only with -w)\n");
 	fprintf(stderr, "  -h, --help             Show this help\n");
 	fprintf(stderr, "\nBy default, creates a static read-only image without branching support.\n");
@@ -589,6 +599,7 @@ int main(int argc, char *argv[])
 		{"size", required_argument, 0, 's'},
 		{"delta", required_argument, 0, 'D'},
 		{"writable", no_argument, 0, 'w'},
+		{"validate", no_argument, 0, 'V'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
 	};
@@ -607,8 +618,9 @@ int main(int argc, char *argv[])
 	int ret = 1;
 	size_t delta_size = DAXFS_DEFAULT_DELTA_SIZE;
 	bool writable = false;
+	bool validate = false;
 
-	while ((opt = getopt_long(argc, argv, "d:o:H:m:p:s:D:wh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:H:m:p:s:D:wVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			src_dir = optarg;
@@ -641,6 +653,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'w':
 			writable = true;
+			break;
+		case 'V':
+			validate = true;
 			break;
 		case 'h':
 		default:
@@ -756,9 +771,10 @@ int main(int argc, char *argv[])
 		munmap(mem, max_size);
 
 		/* Mount using the dma-buf fd via the new mount API */
-		printf("Mounting on %s (%s)...\n", mountpoint,
-		       writable ? "read-write" : "read-only");
-		if (mount_daxfs_dmabuf(dmabuf_fd, mountpoint, writable) < 0) {
+		printf("Mounting on %s (%s%s)...\n", mountpoint,
+		       writable ? "read-write" : "read-only",
+		       validate ? ", validating" : "");
+		if (mount_daxfs_dmabuf(dmabuf_fd, mountpoint, writable, validate) < 0) {
 			close(dmabuf_fd);
 			return 1;
 		}
