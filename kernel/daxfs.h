@@ -163,10 +163,19 @@ extern struct inode *daxfs_iget(struct super_block *sb, u64 ino);
 extern const struct inode_operations daxfs_dir_inode_ops;
 extern const struct file_operations daxfs_dir_ops;
 
+/* dir.c - read-only ops */
+extern const struct inode_operations daxfs_dir_inode_ops_ro;
+extern const struct file_operations daxfs_dir_ops_ro;
+
 /* file.c */
 extern const struct inode_operations daxfs_file_inode_ops;
 extern const struct file_operations daxfs_file_ops;
 extern const struct address_space_operations daxfs_aops;
+
+/* file.c - read-only ops */
+extern const struct inode_operations daxfs_file_inode_ops_ro;
+extern const struct file_operations daxfs_file_ops_ro;
+extern const struct address_space_operations daxfs_aops_ro;
 
 /* inode.c */
 extern struct inode *daxfs_alloc_inode(struct super_block *sb);

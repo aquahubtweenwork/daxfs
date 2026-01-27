@@ -105,28 +105,54 @@ struct inode *daxfs_iget(struct super_block *sb, u64 ino)
 		inode_set_atime_to_ts(inode,
 			inode_set_ctime_to_ts(inode, zerotime)));
 
-	switch (mode & S_IFMT) {
-	case S_IFREG:
-		inode->i_op = &daxfs_file_inode_ops;
-		inode->i_fop = &daxfs_file_ops;
-		inode->i_mapping->a_ops = &daxfs_aops;
-		break;
-	case S_IFDIR:
-		inode->i_op = &daxfs_dir_inode_ops;
-		inode->i_fop = &daxfs_dir_ops;
-		break;
-	case S_IFLNK:
-		inode->i_op = &simple_symlink_inode_operations;
-		/* TODO: handle symlinks in delta */
-		if (di->raw && !di->from_delta) {
-			/* Use storage layer for symlink target */
-			u64 symlink_offset = le64_to_cpu(info->super->base_offset) +
-					     di->data_offset;
-			inode->i_link = daxfs_mem_ptr(info, symlink_offset);
+	if (info->static_image) {
+		/* Static image mode - use read-only ops */
+		switch (mode & S_IFMT) {
+		case S_IFREG:
+			inode->i_op = &daxfs_file_inode_ops_ro;
+			inode->i_fop = &daxfs_file_ops_ro;
+			inode->i_mapping->a_ops = &daxfs_aops_ro;
+			break;
+		case S_IFDIR:
+			inode->i_op = &daxfs_dir_inode_ops_ro;
+			inode->i_fop = &daxfs_dir_ops_ro;
+			break;
+		case S_IFLNK:
+			inode->i_op = &simple_symlink_inode_operations;
+			if (di->raw) {
+				u64 symlink_offset = le64_to_cpu(info->super->base_offset) +
+						     di->data_offset;
+				inode->i_link = daxfs_mem_ptr(info, symlink_offset);
+			}
+			break;
+		default:
+			break;
 		}
-		break;
-	default:
-		break;
+	} else {
+		/* Branching mode - use full read-write ops */
+		switch (mode & S_IFMT) {
+		case S_IFREG:
+			inode->i_op = &daxfs_file_inode_ops;
+			inode->i_fop = &daxfs_file_ops;
+			inode->i_mapping->a_ops = &daxfs_aops;
+			break;
+		case S_IFDIR:
+			inode->i_op = &daxfs_dir_inode_ops;
+			inode->i_fop = &daxfs_dir_ops;
+			break;
+		case S_IFLNK:
+			inode->i_op = &simple_symlink_inode_operations;
+			/* TODO: handle symlinks in delta */
+			if (di->raw && !di->from_delta) {
+				/* Use storage layer for symlink target */
+				u64 symlink_offset = le64_to_cpu(info->super->base_offset) +
+						     di->data_offset;
+				inode->i_link = daxfs_mem_ptr(info, symlink_offset);
+			}
+			break;
+		default:
+			break;
+		}
 	}
 
 	unlock_new_inode(inode);

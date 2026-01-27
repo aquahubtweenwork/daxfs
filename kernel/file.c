@@ -440,3 +440,133 @@ const struct inode_operations daxfs_file_inode_ops = {
 	.getattr	= simple_getattr,
 	.setattr	= daxfs_setattr,
 };
+
+/*
+ * ============================================================================
+ * Read-Only Operations (static image mode)
+ * ============================================================================
+ *
+ * These operations provide direct base image access without delta chain walking.
+ * Used when info->static_image is true.
+ */
+
+/*
+ * Get file data directly from base image (no delta chain)
+ */
+static void *daxfs_base_file_data(struct daxfs_info *info, u64 ino,
+				  loff_t pos, size_t len, size_t *out_len)
+{
+	struct daxfs_base_inode *raw;
+	u64 data_offset, file_size;
+	size_t avail;
+
+	if (!info->base_inodes || ino < 1 || ino > info->base_inode_count)
+		return NULL;
+
+	raw = &info->base_inodes[ino - 1];
+	data_offset = le64_to_cpu(raw->data_offset);
+	file_size = le64_to_cpu(raw->size);
+
+	if (pos >= file_size)
+		return NULL;
+
+	avail = file_size - pos;
+	if (len > avail)
+		len = avail;
+
+	if (out_len)
+		*out_len = len;
+
+	return daxfs_mem_ptr(info,
+			     le64_to_cpu(info->super->base_offset) +
+			     data_offset + pos);
+}
+
+static ssize_t daxfs_read_iter_ro(struct kiocb *iocb, struct iov_iter *to)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
+	loff_t pos = iocb->ki_pos;
+	size_t count = iov_iter_count(to);
+	size_t chunk;
+	void *src;
+
+	if (pos >= inode->i_size)
+		return 0;
+
+	if (pos + count > inode->i_size)
+		count = inode->i_size - pos;
+
+	src = daxfs_base_file_data(info, inode->i_ino, pos, count, &chunk);
+	if (!src || chunk == 0)
+		return 0;
+
+	if (copy_to_iter(src, chunk, to) != chunk)
+		return -EFAULT;
+
+	iocb->ki_pos = pos + chunk;
+	return chunk;
+}
+
+static int daxfs_read_folio_ro(struct file *file, struct folio *folio)
+{
+	struct inode *inode = folio->mapping->host;
+	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
+	loff_t pos = folio_pos(folio);
+	size_t len = folio_size(folio);
+	size_t chunk;
+	void *src;
+
+	if (pos >= inode->i_size) {
+		folio_zero_range(folio, 0, len);
+		goto out;
+	}
+
+	src = daxfs_base_file_data(info, inode->i_ino, pos, len, &chunk);
+	if (src && chunk > 0)
+		memcpy_to_folio(folio, 0, src, chunk);
+	else
+		chunk = 0;
+
+	if (chunk < len)
+		folio_zero_range(folio, chunk, len - chunk);
+
+out:
+	folio_mark_uptodate(folio);
+	folio_unlock(folio);
+	return 0;
+}
+
+static const struct vm_operations_struct daxfs_vm_ops_ro = {
+	.fault		= filemap_fault,
+	.map_pages	= filemap_map_pages,
+	/* No page_mkwrite - read-only */
+};
+
+static int daxfs_file_mmap_ro(struct file *file, struct vm_area_struct *vma)
+{
+	if (vma->vm_flags & VM_WRITE)
+		return -EACCES;
+
+	file_accessed(file);
+	vma->vm_ops = &daxfs_vm_ops_ro;
+	return 0;
+}
+
+const struct address_space_operations daxfs_aops_ro = {
+	.read_folio	= daxfs_read_folio_ro,
+	/* No writepages - read-only */
+};
+
+const struct file_operations daxfs_file_ops_ro = {
+	.llseek		= generic_file_llseek,
+	.read_iter	= daxfs_read_iter_ro,
+	.splice_read	= filemap_splice_read,
+	.mmap		= daxfs_file_mmap_ro,
+	/* No write_iter, no open/release tracking needed */
+};
+
+const struct inode_operations daxfs_file_inode_ops_ro = {
+	.getattr	= simple_getattr,
+	/* No setattr - read-only */
+};

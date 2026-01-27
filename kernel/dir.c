@@ -418,3 +418,121 @@ const struct file_operations daxfs_dir_ops = {
 	.read		= generic_read_dir,
 	.llseek		= generic_file_llseek,
 };
+
+/*
+ * ============================================================================
+ * Read-Only Operations (static image mode)
+ * ============================================================================
+ *
+ * These operations provide direct base image access without delta checks.
+ * Used when info->static_image is true.
+ */
+
+/*
+ * Check if name exists in base image only (no delta checks)
+ */
+static bool daxfs_name_exists_base(struct daxfs_info *info, u64 parent_ino,
+				   const char *name, int namelen, u64 *ino_out)
+{
+	struct daxfs_base_inode *parent_raw;
+	u32 child_ino;
+
+	if (!info->base_inodes || parent_ino > info->base_inode_count)
+		return false;
+
+	parent_raw = &info->base_inodes[parent_ino - 1];
+	child_ino = le32_to_cpu(parent_raw->first_child);
+
+	while (child_ino && child_ino <= info->base_inode_count) {
+		struct daxfs_base_inode *child = &info->base_inodes[child_ino - 1];
+		char *child_name = info->base_strtab +
+				   le32_to_cpu(child->name_offset);
+		u32 child_name_len = le32_to_cpu(child->name_len);
+
+		if (namelen == child_name_len &&
+		    memcmp(name, child_name, namelen) == 0) {
+			if (ino_out)
+				*ino_out = child_ino;
+			return true;
+		}
+
+		child_ino = le32_to_cpu(child->next_sibling);
+	}
+
+	return false;
+}
+
+static struct dentry *daxfs_lookup_ro(struct inode *dir, struct dentry *dentry,
+				      unsigned int flags)
+{
+	struct daxfs_info *info = DAXFS_SB(dir->i_sb);
+	struct inode *inode = NULL;
+	u64 ino;
+
+	if (daxfs_name_exists_base(info, dir->i_ino,
+				   dentry->d_name.name, dentry->d_name.len,
+				   &ino)) {
+		inode = daxfs_iget(dir->i_sb, ino);
+		if (IS_ERR(inode))
+			return ERR_CAST(inode);
+	}
+
+	return d_splice_alias(inode, dentry);
+}
+
+static int daxfs_iterate_ro(struct file *file, struct dir_context *ctx)
+{
+	struct inode *dir = file_inode(file);
+	struct daxfs_info *info = DAXFS_SB(dir->i_sb);
+	struct daxfs_base_inode *dir_raw;
+	u32 child_ino;
+	loff_t pos = 2;  /* Start after . and .. */
+
+	if (!dir_emit_dots(file, ctx))
+		return 0;
+
+	if (!info->base_inodes || dir->i_ino > info->base_inode_count)
+		return 0;
+
+	dir_raw = &info->base_inodes[dir->i_ino - 1];
+	child_ino = le32_to_cpu(dir_raw->first_child);
+
+	while (child_ino && child_ino <= info->base_inode_count) {
+		struct daxfs_base_inode *child = &info->base_inodes[child_ino - 1];
+		char *name;
+		u32 name_len, mode;
+		unsigned char dtype;
+
+		if (pos >= ctx->pos) {
+			name = info->base_strtab + le32_to_cpu(child->name_offset);
+			name_len = le32_to_cpu(child->name_len);
+			mode = le32_to_cpu(child->mode);
+
+			switch (mode & S_IFMT) {
+			case S_IFREG: dtype = DT_REG; break;
+			case S_IFDIR: dtype = DT_DIR; break;
+			case S_IFLNK: dtype = DT_LNK; break;
+			default: dtype = DT_UNKNOWN; break;
+			}
+
+			if (!dir_emit(ctx, name, name_len, child_ino, dtype))
+				return 0;
+			ctx->pos = pos + 1;
+		}
+		pos++;
+		child_ino = le32_to_cpu(child->next_sibling);
+	}
+
+	return 0;
+}
+
+const struct inode_operations daxfs_dir_inode_ops_ro = {
+	.lookup		= daxfs_lookup_ro,
+	/* No create, mkdir, unlink, rmdir, rename - read-only */
+};
+
+const struct file_operations daxfs_dir_ops_ro = {
+	.iterate_shared	= daxfs_iterate_ro,
+	.read		= generic_read_dir,
+	.llseek		= generic_file_llseek,
+};
