@@ -4,9 +4,12 @@ CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra
 CFLAGS += -I../include
 
-TARGETS = daxfs-branch daxfs-inspect
+TARGETS = mkdaxfs daxfs-branch daxfs-inspect
 
 all: $(TARGETS)
+
+mkdaxfs: mkdaxfs.c
+	$(CC) $(CFLAGS) -o $@ $<
 
 daxfs-branch: daxfs-branch.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -17,4 +20,7 @@ daxfs-inspect: daxfs-inspect.c
 clean:
 	rm -f $(TARGETS)
 
-.PHONY: all clean
+install: $(TARGETS)
+	install -m 755 $(TARGETS) /usr/local/bin/
+
+.PHONY: all clean install
