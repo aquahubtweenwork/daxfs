@@ -51,14 +51,12 @@ struct dma_heap_allocation_data {
 
 struct file_entry {
 	char path[PATH_MAX];
-	char name[256];
+	char name[DAXFS_NAME_MAX + 1];  /* 128 + null */
 	struct stat st;
 	uint32_t ino;
 	uint32_t parent_ino;
-	uint32_t first_child;
-	uint32_t next_sibling;
-	uint64_t data_offset;
-	uint32_t name_strtab_offset;
+	uint64_t data_offset;		/* For files: file data; for dirs: dirent array */
+	uint32_t child_count;		/* Number of direct children (for dirs) */
 	struct file_entry *next;
 };
 
@@ -66,7 +64,6 @@ static struct file_entry *files_head;
 static struct file_entry *files_tail;
 static uint32_t file_count;
 static uint32_t next_ino = 1;
-static size_t strtab_size;
 
 static struct file_entry *find_by_path(const char *path)
 {
@@ -79,21 +76,11 @@ static struct file_entry *find_by_path(const char *path)
 	return NULL;
 }
 
-static struct file_entry *find_by_ino(uint32_t ino)
-{
-	struct file_entry *e;
-
-	for (e = files_head; e; e = e->next) {
-		if (e->ino == ino)
-			return e;
-	}
-	return NULL;
-}
-
 static struct file_entry *add_file(const char *path, struct stat *st)
 {
 	struct file_entry *e;
 	char *slash;
+	size_t name_len;
 
 	e = calloc(1, sizeof(*e));
 	if (!e)
@@ -105,11 +92,21 @@ static struct file_entry *add_file(const char *path, struct stat *st)
 
 	slash = strrchr(path, '/');
 	if (slash && slash[1])
-		strncpy(e->name, slash + 1, sizeof(e->name) - 1);
+		name_len = strlen(slash + 1);
 	else
-		strncpy(e->name, path, sizeof(e->name) - 1);
+		name_len = strlen(path);
 
-	strtab_size += strlen(e->name) + 1;
+	if (name_len > DAXFS_NAME_MAX) {
+		fprintf(stderr, "Warning: name too long, truncating: %s\n",
+			slash ? slash + 1 : path);
+		name_len = DAXFS_NAME_MAX;
+	}
+
+	if (slash && slash[1])
+		strncpy(e->name, slash + 1, DAXFS_NAME_MAX);
+	else
+		strncpy(e->name, path, DAXFS_NAME_MAX);
+	e->name[DAXFS_NAME_MAX] = '\0';
 
 	if (!files_head) {
 		files_head = files_tail = e;
@@ -203,16 +200,7 @@ static void build_tree(void)
 		parent = find_by_path(parent_path);
 		if (parent) {
 			e->parent_ino = parent->ino;
-
-			if (parent->first_child == 0) {
-				parent->first_child = e->ino;
-			} else {
-				struct file_entry *sibling = find_by_ino(parent->first_child);
-				while (sibling && sibling->next_sibling)
-					sibling = find_by_ino(sibling->next_sibling);
-				if (sibling)
-					sibling->next_sibling = e->ino;
-			}
+			parent->child_count++;
 		}
 	}
 }
@@ -221,49 +209,53 @@ static void calculate_offsets(void)
 {
 	struct file_entry *e;
 	uint64_t inode_offset = DAXFS_BLOCK_SIZE;
-	uint64_t strtab_offset = inode_offset + file_count * DAXFS_INODE_SIZE;
-	uint64_t data_offset = ALIGN(strtab_offset + strtab_size, DAXFS_BLOCK_SIZE);
-	uint32_t str_off = 0;
+	/* v3 format: no string table, data area directly after inodes */
+	uint64_t data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
+				     DAXFS_BLOCK_SIZE);
 
 	for (e = files_head; e; e = e->next) {
-		e->name_strtab_offset = str_off;
-		str_off += strlen(e->name) + 1;
-
-		if (S_ISREG(e->st.st_mode) || S_ISLNK(e->st.st_mode)) {
+		if (S_ISREG(e->st.st_mode)) {
 			e->data_offset = data_offset;
 			data_offset += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+		} else if (S_ISLNK(e->st.st_mode)) {
+			e->data_offset = data_offset;
+			/* +1 for null terminator */
+			data_offset += ALIGN(e->st.st_size + 1, DAXFS_BLOCK_SIZE);
+		} else if (S_ISDIR(e->st.st_mode) && e->child_count > 0) {
+			/* Directories store dirent array in data area */
+			e->data_offset = data_offset;
+			data_offset += ALIGN(e->child_count * DAXFS_DIRENT_SIZE,
+					     DAXFS_BLOCK_SIZE);
 		}
 	}
 }
 
 /*
  * Write the base image portion (embedded read-only snapshot)
+ * v3 format: flat directories with inline names, no string table
  */
 static int write_base_image(void *mem, size_t mem_size, const char *src_dir)
 {
-	struct file_entry *e;
+	struct file_entry *e, *child;
 	struct daxfs_base_super *base_super = mem;
 	struct daxfs_base_inode *inodes;
-	char *strtab;
 	uint64_t inode_offset = DAXFS_BLOCK_SIZE;
-	uint64_t strtab_offset = inode_offset + file_count * DAXFS_INODE_SIZE;
-	uint64_t data_offset = ALIGN(strtab_offset + strtab_size, DAXFS_BLOCK_SIZE);
+	uint64_t data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
+				     DAXFS_BLOCK_SIZE);
 
 	memset(mem, 0, mem_size);
 
+	/* v3 base superblock - no string table */
 	base_super->magic = htole32(DAXFS_BASE_MAGIC);
-	base_super->version = htole32(1);
+	base_super->version = htole32(DAXFS_VERSION);
 	base_super->flags = htole32(0);
 	base_super->block_size = htole32(DAXFS_BLOCK_SIZE);
 	base_super->inode_count = htole32(file_count);
 	base_super->root_inode = htole32(DAXFS_ROOT_INO);
 	base_super->inode_offset = htole64(inode_offset);
-	base_super->strtab_offset = htole64(strtab_offset);
-	base_super->strtab_size = htole64(strtab_size);
 	base_super->data_offset = htole64(data_offset);
 
 	inodes = mem + inode_offset;
-	strtab = mem + strtab_offset;
 
 	for (e = files_head; e; e = e->next) {
 		struct daxfs_base_inode *di = &inodes[e->ino - 1];
@@ -272,21 +264,15 @@ static int write_base_image(void *mem, size_t mem_size, const char *src_dir)
 		di->mode = htole32(e->st.st_mode);
 		di->uid = htole32(e->st.st_uid);
 		di->gid = htole32(e->st.st_gid);
-		di->size = htole64(e->st.st_size);
-		di->data_offset = htole64(e->data_offset);
-		di->name_offset = htole32(e->name_strtab_offset);
-		di->name_len = htole32(strlen(e->name));
-		di->parent_ino = htole32(e->parent_ino);
 		di->nlink = htole32(e->st.st_nlink);
-		di->first_child = htole32(e->first_child);
-		di->next_sibling = htole32(e->next_sibling);
-
-		strcpy(strtab + e->name_strtab_offset, e->name);
 
 		if (S_ISREG(e->st.st_mode)) {
 			char fullpath[PATH_MAX * 2];
 			int fd;
 			ssize_t n;
+
+			di->size = htole64(e->st.st_size);
+			di->data_offset = htole64(e->data_offset);
 
 			snprintf(fullpath, sizeof(fullpath), "%s/%s", src_dir, e->path);
 			fd = open(fullpath, O_RDONLY);
@@ -302,6 +288,9 @@ static int write_base_image(void *mem, size_t mem_size, const char *src_dir)
 			char fullpath[PATH_MAX * 2];
 			ssize_t n;
 
+			di->size = htole64(e->st.st_size);
+			di->data_offset = htole64(e->data_offset);
+
 			snprintf(fullpath, sizeof(fullpath), "%s/%s", src_dir, e->path);
 			n = readlink(fullpath, mem + e->data_offset, e->st.st_size);
 			if (n < 0)
@@ -309,7 +298,47 @@ static int write_base_image(void *mem, size_t mem_size, const char *src_dir)
 			else
 				/* Ensure null-termination for kernel safety */
 				((char *)(mem + e->data_offset))[n] = '\0';
+		} else if (S_ISDIR(e->st.st_mode)) {
+			/* Directory: write dirent array */
+			struct daxfs_dirent *dirents;
+			uint32_t dirent_idx = 0;
+
+			/* Size = number of entries * DAXFS_DIRENT_SIZE */
+			di->size = htole64((uint64_t)e->child_count * DAXFS_DIRENT_SIZE);
+			di->data_offset = htole64(e->data_offset);
+
+			if (e->child_count > 0) {
+				dirents = mem + e->data_offset;
+
+				/* Find all children and write dirents */
+				for (child = files_head; child; child = child->next) {
+					if (child->parent_ino == e->ino) {
+						struct daxfs_dirent *de = &dirents[dirent_idx++];
+						size_t name_len = strlen(child->name);
+
+						de->ino = htole32(child->ino);
+						de->mode = htole32(child->st.st_mode);
+						de->name_len = htole16(name_len);
+						memcpy(de->name, child->name, name_len);
+					}
+				}
+			}
 		}
+	}
+
+	/* Calculate and set total size */
+	{
+		uint64_t total = data_offset;
+		for (e = files_head; e; e = e->next) {
+			if (S_ISREG(e->st.st_mode))
+				total = e->data_offset + ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+			else if (S_ISLNK(e->st.st_mode))
+				total = e->data_offset + ALIGN(e->st.st_size + 1, DAXFS_BLOCK_SIZE);
+			else if (S_ISDIR(e->st.st_mode) && e->child_count > 0)
+				total = e->data_offset + ALIGN(e->child_count * DAXFS_DIRENT_SIZE,
+							       DAXFS_BLOCK_SIZE);
+		}
+		base_super->total_size = htole64(total);
 	}
 
 	return 0;
@@ -319,13 +348,18 @@ static size_t calculate_base_size(void)
 {
 	struct file_entry *e;
 	uint64_t inode_offset = DAXFS_BLOCK_SIZE;
-	uint64_t strtab_offset = inode_offset + file_count * DAXFS_INODE_SIZE;
-	uint64_t data_offset = ALIGN(strtab_offset + strtab_size, DAXFS_BLOCK_SIZE);
+	/* v3 format: no string table, data area directly after inodes */
+	uint64_t data_offset = ALIGN(inode_offset + file_count * DAXFS_INODE_SIZE,
+				     DAXFS_BLOCK_SIZE);
 	size_t total = data_offset;
 
 	for (e = files_head; e; e = e->next) {
-		if (S_ISREG(e->st.st_mode) || S_ISLNK(e->st.st_mode))
+		if (S_ISREG(e->st.st_mode))
 			total += ALIGN(e->st.st_size, DAXFS_BLOCK_SIZE);
+		else if (S_ISLNK(e->st.st_mode))
+			total += ALIGN(e->st.st_size + 1, DAXFS_BLOCK_SIZE);  /* +1 for null */
+		else if (S_ISDIR(e->st.st_mode) && e->child_count > 0)
+			total += ALIGN(e->child_count * DAXFS_DIRENT_SIZE, DAXFS_BLOCK_SIZE);
 	}
 
 	return total;
@@ -451,7 +485,7 @@ static int write_static_image(void *mem, size_t mem_size, const char *src_dir,
 	memset(mem, 0, mem_size);
 
 	/* Write superblock */
-	super->magic = htole32(DAXFS2_MAGIC);
+	super->magic = htole32(DAXFS_MAGIC);
 	super->version = htole32(DAXFS_VERSION);
 	super->flags = htole32(0);
 	super->block_size = htole32(DAXFS_BLOCK_SIZE);
@@ -508,7 +542,7 @@ static int write_image(void *mem, size_t mem_size, const char *src_dir,
 	memset(mem, 0, mem_size);
 
 	/* Write superblock */
-	super->magic = htole32(DAXFS2_MAGIC);
+	super->magic = htole32(DAXFS_MAGIC);
 	super->version = htole32(DAXFS_VERSION);
 	super->flags = htole32(0);
 	super->block_size = htole32(DAXFS_BLOCK_SIZE);

@@ -111,9 +111,9 @@ static int open_image(const char *path)
 	}
 
 	super = mem;
-	if (le32_to_cpu(super->magic) != DAXFS2_MAGIC) {
+	if (le32_to_cpu(super->magic) != DAXFS_MAGIC) {
 		fprintf(stderr, "Error: invalid magic 0x%x (expected 0x%x)\n",
-			le32_to_cpu(super->magic), DAXFS2_MAGIC);
+			le32_to_cpu(super->magic), DAXFS_MAGIC);
 		munmap(mem, mem_size);
 		return -1;
 	}

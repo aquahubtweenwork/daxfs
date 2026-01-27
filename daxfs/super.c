@@ -114,53 +114,7 @@ static int daxfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 }
 
 /*
- * Validate directory structure for cycles
- * Returns 0 on success, -ELOOP if cycle detected
- */
-static int daxfs_validate_dir_structure(struct daxfs_info *info)
-{
-	u32 inode_count = info->base_inode_count;
-	u32 i;
-
-	/*
-	 * For each directory, walk its children via first_child/next_sibling.
-	 * If we visit more inodes than exist, there's a cycle.
-	 */
-	for (i = 0; i < inode_count; i++) {
-		struct daxfs_base_inode *dir = &info->base_inodes[i];
-		u32 mode = le32_to_cpu(dir->mode);
-		u32 child_ino, visited;
-
-		if (!S_ISDIR(mode))
-			continue;
-
-		child_ino = le32_to_cpu(dir->first_child);
-		visited = 0;
-
-		while (child_ino != 0) {
-			struct daxfs_base_inode *child;
-
-			if (child_ino > inode_count) {
-				/* Already caught by bounds check, but be safe */
-				return -EINVAL;
-			}
-
-			visited++;
-			if (visited > inode_count) {
-				pr_err("daxfs: cycle detected in directory %u\n", i + 1);
-				return -ELOOP;
-			}
-
-			child = &info->base_inodes[child_ino - 1];
-			child_ino = le32_to_cpu(child->next_sibling);
-		}
-	}
-
-	return 0;
-}
-
-/*
- * Validate the base image structure for security
+ * Validate the base image structure for security (v3 flat directory format)
  * Returns 0 on success, -errno on error
  */
 int daxfs_validate_base_image(struct daxfs_info *info)
@@ -168,18 +122,23 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 	struct daxfs_base_super *base = info->base_super;
 	u64 base_offset = le64_to_cpu(info->super->base_offset);
 	u64 base_size = le64_to_cpu(info->super->base_size);
-	u64 inode_offset, strtab_offset, data_offset;
-	u64 strtab_size;
+	u64 inode_offset, data_offset;
 	u32 inode_count, i;
-	int ret;
 
 	if (!base)
 		return 0;  /* No base image */
 
 	/* Validate base image magic */
 	if (le32_to_cpu(base->magic) != DAXFS_BASE_MAGIC) {
-		pr_err("daxfs: invalid base image magic 0x%x\n",
-		       le32_to_cpu(base->magic));
+		pr_err("daxfs: invalid base image magic 0x%x (expected 0x%x)\n",
+		       le32_to_cpu(base->magic), DAXFS_BASE_MAGIC);
+		return -EINVAL;
+	}
+
+	/* Validate version */
+	if (le32_to_cpu(base->version) != DAXFS_VERSION) {
+		pr_err("daxfs: unsupported base image version %u\n",
+		       le32_to_cpu(base->version));
 		return -EINVAL;
 	}
 
@@ -190,8 +149,6 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 	}
 
 	inode_offset = le64_to_cpu(base->inode_offset);
-	strtab_offset = le64_to_cpu(base->strtab_offset);
-	strtab_size = le64_to_cpu(base->strtab_size);
 	data_offset = le64_to_cpu(base->data_offset);
 	inode_count = le32_to_cpu(base->inode_count);
 
@@ -202,12 +159,6 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 		return -EINVAL;
 	}
 
-	/* Validate string table bounds */
-	if (strtab_offset > base_size || strtab_size > base_size - strtab_offset) {
-		pr_err("daxfs: string table exceeds base image bounds\n");
-		return -EINVAL;
-	}
-
 	/* Validate root inode exists */
 	if (le32_to_cpu(base->root_inode) < 1 ||
 	    le32_to_cpu(base->root_inode) > inode_count) {
@@ -215,52 +166,56 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 		return -EINVAL;
 	}
 
-	/* Validate each inode's offsets and references */
+	/* Validate each inode's data offset */
 	for (i = 0; i < inode_count; i++) {
 		struct daxfs_base_inode *raw = &info->base_inodes[i];
-		u32 name_offset = le32_to_cpu(raw->name_offset);
-		u32 name_len = le32_to_cpu(raw->name_len);
 		u64 file_data_offset = le64_to_cpu(raw->data_offset);
 		u64 file_size = le64_to_cpu(raw->size);
-		u32 first_child = le32_to_cpu(raw->first_child);
-		u32 next_sibling = le32_to_cpu(raw->next_sibling);
-		u32 parent_ino = le32_to_cpu(raw->parent_ino);
 		u32 mode = le32_to_cpu(raw->mode);
 
-		/* Validate string table reference */
-		if (!daxfs_valid_strtab(info, name_offset, name_len)) {
-			pr_err("daxfs: inode %u has invalid name reference\n", i + 1);
-			return -EINVAL;
-		}
-
-		/* Validate data offset for files and symlinks */
-		if (S_ISREG(mode) || S_ISLNK(mode)) {
+		/* Validate data offset bounds */
+		if (file_size > 0) {
 			if (!daxfs_valid_base_offset(info, file_data_offset, file_size)) {
 				pr_err("daxfs: inode %u has invalid data offset\n", i + 1);
 				return -EINVAL;
 			}
 		}
 
-		/* Validate directory child/sibling references */
-		if (first_child != 0 && first_child > inode_count) {
-			pr_err("daxfs: inode %u has invalid first_child\n", i + 1);
-			return -EINVAL;
-		}
-		if (next_sibling != 0 && next_sibling > inode_count) {
-			pr_err("daxfs: inode %u has invalid next_sibling\n", i + 1);
-			return -EINVAL;
-		}
-		if (parent_ino != 0 && parent_ino > inode_count) {
-			pr_err("daxfs: inode %u has invalid parent_ino\n", i + 1);
-			return -EINVAL;
+		/* For directories, validate dirent array */
+		if (S_ISDIR(mode) && file_size > 0) {
+			u32 num_entries = file_size / DAXFS_DIRENT_SIZE;
+			u32 j;
+			struct daxfs_dirent *dirents;
+
+			/* Size must be multiple of DAXFS_DIRENT_SIZE */
+			if (file_size % DAXFS_DIRENT_SIZE != 0) {
+				pr_err("daxfs: dir inode %u has invalid size\n", i + 1);
+				return -EINVAL;
+			}
+
+			dirents = daxfs_mem_ptr(info, base_offset + file_data_offset);
+
+			/* Validate each dirent */
+			for (j = 0; j < num_entries; j++) {
+				struct daxfs_dirent *de = &dirents[j];
+				u32 child_ino = le32_to_cpu(de->ino);
+				u16 name_len = le16_to_cpu(de->name_len);
+
+				if (child_ino < 1 || child_ino > inode_count) {
+					pr_err("daxfs: dir %u entry %u has invalid ino\n",
+					       i + 1, j);
+					return -EINVAL;
+				}
+
+				if (name_len > DAXFS_NAME_MAX) {
+					pr_err("daxfs: dir %u entry %u name too long\n",
+					       i + 1, j);
+					return -EINVAL;
+				}
+			}
 		}
 
-		/*
-		 * Ensure symlink targets are null-terminated.
-		 * The size field is the string length (without null), so the null
-		 * should be at position file_size. We check file_size + 1 bytes
-		 * to allow for the null terminator, but verify the offset is valid.
-		 */
+		/* For symlinks, ensure null-termination */
 		if (S_ISLNK(mode) && file_size > 0) {
 			char *target = daxfs_mem_ptr(info,
 				base_offset + file_data_offset);
@@ -280,10 +235,7 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 		}
 	}
 
-	/* Validate directory structure for cycles */
-	ret = daxfs_validate_dir_structure(info);
-	if (ret)
-		return ret;
+	/* No cycle detection needed - flat directory format has no linked lists */
 
 	return 0;
 }
@@ -372,9 +324,9 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	/* Validate magic */
 	magic = le32_to_cpu(*((__le32 *)daxfs_mem_ptr(info, 0)));
-	if (magic != DAXFS2_MAGIC) {
+	if (magic != DAXFS_MAGIC) {
 		pr_err("daxfs: invalid magic 0x%x (expected 0x%x)\n",
-		       magic, DAXFS2_MAGIC);
+		       magic, DAXFS_MAGIC);
 		ret = -EINVAL;
 		goto err_unmap;
 	}
@@ -411,8 +363,8 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		info->base_super = daxfs_mem_ptr(info, base_off);
 		info->base_inodes = daxfs_mem_ptr(info,
 			base_off + le64_to_cpu(info->base_super->inode_offset));
-		info->base_strtab = daxfs_mem_ptr(info,
-			base_off + le64_to_cpu(info->base_super->strtab_offset));
+		info->base_data_offset = base_off +
+			le64_to_cpu(info->base_super->data_offset);
 		info->base_inode_count =
 			le32_to_cpu(info->base_super->inode_count);
 
@@ -425,7 +377,7 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 
 	sb->s_op = &daxfs_super_ops;
-	sb->s_magic = DAXFS2_MAGIC;
+	sb->s_magic = DAXFS_MAGIC;
 
 	/*
 	 * Static image (no branch table) - read-only, no branching
@@ -730,7 +682,7 @@ static int daxfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct daxfs_info *info = DAXFS_SB(dentry->d_sb);
 
-	buf->f_type = DAXFS2_MAGIC;
+	buf->f_type = DAXFS_MAGIC;
 	buf->f_bsize = DAXFS_BLOCK_SIZE;
 	buf->f_blocks = info->size / DAXFS_BLOCK_SIZE;
 

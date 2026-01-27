@@ -111,10 +111,10 @@ struct daxfs_info {
 	u32 branch_table_entries;
 	struct daxfs_branch_ctx *current_branch;
 
-	/* Base image access (embedded v1 compatible image) */
+	/* Base image access */
 	struct daxfs_base_super *base_super;
 	struct daxfs_base_inode *base_inodes;
-	char *base_strtab;
+	u64 base_data_offset;		/* Absolute offset to data region */
 	u32 base_inode_count;
 
 	/* Static image mode (no branching) */
@@ -299,23 +299,6 @@ static inline bool daxfs_valid_base_offset(struct daxfs_info *info,
 	if (offset > SIZE_MAX - len)
 		return false;
 	return offset + len <= base_size;
-}
-
-/* Check if a string table access is valid */
-static inline bool daxfs_valid_strtab(struct daxfs_info *info,
-				      u32 name_offset, u32 name_len)
-{
-	u64 strtab_size;
-
-	if (!info->base_super)
-		return false;
-
-	strtab_size = le64_to_cpu(info->base_super->strtab_size);
-
-	/* Check for overflow */
-	if ((u64)name_offset + name_len > strtab_size)
-		return false;
-	return true;
 }
 
 /* Validate base image on mount - returns 0 on success, -errno on error */

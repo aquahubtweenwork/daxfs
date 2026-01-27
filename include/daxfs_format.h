@@ -11,10 +11,12 @@
 
 #include <linux/types.h>
 
-#define DAXFS2_MAGIC		0x64617832	/* "dax2" */
-#define DAXFS_VERSION		2
+#define DAXFS_MAGIC		0x64617833	/* "dax3" */
+#define DAXFS_VERSION		3
 #define DAXFS_BLOCK_SIZE	4096
 #define DAXFS_INODE_SIZE	64
+#define DAXFS_NAME_MAX		128
+#define DAXFS_DIRENT_SIZE	(16 + DAXFS_NAME_MAX)	/* ino + mode + name_len + reserved + name */
 #define DAXFS_ROOT_INO		1
 
 #define DAXFS_BRANCH_NAME_MAX	31
@@ -43,7 +45,7 @@
  * [ Superblock (4KB) | Branch Table | Base Image (optional) | Delta Region ]
  */
 struct daxfs_super {
-	__le32 magic;			/* DAXFS_MAGIC */
+	__le32 magic;			/* DAXFS_MAGIC (0x64617833) */
 	__le32 version;			/* DAXFS_VERSION */
 	__le32 flags;
 	__le32 block_size;		/* 4096 */
@@ -183,49 +185,62 @@ struct daxfs_delta_symlink {
  *
  * The base image is an optional embedded read-only filesystem image
  * that provides the initial state. New changes are stored in deltas.
+ *
+ * Version 3 uses flat directories: directory contents are stored as an
+ * array of daxfs_dirent entries in the data area. No linked lists, no
+ * string table - names are stored directly in directory entries.
  */
 
-#define DAXFS_BASE_MAGIC	0x64646178	/* "ddax" */
+#define DAXFS_BASE_MAGIC	0x64646179	/* "dday" - version 3 */
 
 /*
  * Base image superblock - always at base_offset, padded to DAXFS_BLOCK_SIZE
  */
 struct daxfs_base_super {
 	__le32 magic;		/* DAXFS_BASE_MAGIC */
-	__le32 version;		/* 1 */
+	__le32 version;		/* 3 */
 	__le32 flags;
 	__le32 block_size;	/* Always DAXFS_BLOCK_SIZE */
 	__le64 total_size;	/* Total base image size in bytes */
 	__le64 inode_offset;	/* Offset to inode table (relative to base) */
 	__le32 inode_count;	/* Number of inodes */
 	__le32 root_inode;	/* Root directory inode number */
-	__le64 strtab_offset;	/* Offset to string table (relative to base) */
-	__le64 strtab_size;	/* Size of string table */
 	__le64 data_offset;	/* Offset to file data area (relative to base) */
-	__u8   reserved[4032];	/* Pad to 4KB */
+	__u8   reserved[4048];	/* Pad to 4KB */
 };
 
 /*
- * Base image inode - fixed size for simple indexing
+ * Base image inode - fixed size for simple indexing (64 bytes)
  *
- * Directories use first_child/next_sibling for a linked list structure.
- * Regular files store data at data_offset.
- * Symlinks store target path at data_offset.
+ * For directories: data_offset points to array of daxfs_dirent,
+ *                  size = number of entries * DAXFS_DIRENT_SIZE
+ * For regular files: data_offset points to file data, size = file size
+ * For symlinks: data_offset points to target string (null-terminated),
+ *               size = target length (excluding null)
  */
 struct daxfs_base_inode {
 	__le32 ino;		/* Inode number (1-based) */
 	__le32 mode;		/* File type and permissions */
 	__le32 uid;		/* Owner UID */
 	__le32 gid;		/* Owner GID */
-	__le64 size;		/* File size in bytes */
-	__le64 data_offset;	/* Offset to file data (relative to base) */
-	__le32 name_offset;	/* Offset into string table for filename */
-	__le32 name_len;	/* Length of filename */
-	__le32 parent_ino;	/* Parent directory inode number */
+	__le64 size;		/* Size in bytes (see above) */
+	__le64 data_offset;	/* Offset to data (relative to base) */
 	__le32 nlink;		/* Link count */
-	__le32 first_child;	/* For dirs: first child inode (0 if empty) */
-	__le32 next_sibling;	/* Next entry in same directory (0 if last) */
-	__u8   reserved[8];	/* Pad to DAXFS_INODE_SIZE (64 bytes) */
+	__u8   reserved[28];	/* Pad to DAXFS_INODE_SIZE (64 bytes) */
+};
+
+/*
+ * Directory entry - fixed size for simple validation
+ *
+ * Directories store an array of these entries at their data_offset.
+ * Names are stored inline, no string table needed.
+ */
+struct daxfs_dirent {
+	__le32 ino;			/* Child inode number */
+	__le32 mode;			/* Child file type and permissions */
+	__le16 name_len;		/* Actual name length */
+	__u8   reserved[6];		/* Padding */
+	char   name[DAXFS_NAME_MAX];	/* Name (not null-terminated, use name_len) */
 };
 
 #endif /* _DAXFS_FORMAT_H */

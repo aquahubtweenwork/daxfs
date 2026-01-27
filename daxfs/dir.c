@@ -9,6 +9,37 @@
 #include "daxfs.h"
 
 /*
+ * Get directory entries from base image (flat dirent array)
+ */
+static struct daxfs_dirent *daxfs_get_base_dirents(struct daxfs_info *info,
+						   u64 dir_ino, u32 *count)
+{
+	struct daxfs_base_inode *dir_raw;
+	u64 base_offset;
+	u64 data_offset;
+	u64 size;
+
+	if (!info->base_inodes || dir_ino > info->base_inode_count) {
+		*count = 0;
+		return NULL;
+	}
+
+	dir_raw = &info->base_inodes[dir_ino - 1];
+	data_offset = le64_to_cpu(dir_raw->data_offset);
+	size = le64_to_cpu(dir_raw->size);
+
+	if (size == 0) {
+		*count = 0;
+		return NULL;
+	}
+
+	/* data_offset is relative to base image start */
+	base_offset = le64_to_cpu(info->super->base_offset);
+	*count = size / DAXFS_DIRENT_SIZE;
+	return daxfs_mem_ptr(info, base_offset + data_offset);
+}
+
+/*
  * Check if name exists in directory (checking deltas first, then base)
  */
 static bool daxfs_name_exists(struct super_block *sb, u64 parent_ino,
@@ -16,6 +47,8 @@ static bool daxfs_name_exists(struct super_block *sb, u64 parent_ino,
 {
 	struct daxfs_info *info = DAXFS_SB(sb);
 	struct daxfs_branch_ctx *b;
+	struct daxfs_dirent *dirents;
+	u32 dirent_count, i;
 
 	/* Check delta logs from child to parent */
 	for (b = info->current_branch; b != NULL; b = b->parent) {
@@ -47,36 +80,23 @@ static bool daxfs_name_exists(struct super_block *sb, u64 parent_ino,
 		}
 	}
 
-	/* Check base image */
-	if (info->base_inodes) {
-		struct daxfs_base_inode *parent_raw;
-		u32 child_ino;
+	/* Check base image (flat dirent array) */
+	dirents = daxfs_get_base_dirents(info, parent_ino, &dirent_count);
+	for (i = 0; i < dirent_count; i++) {
+		struct daxfs_dirent *de = &dirents[i];
+		u32 child_ino = le32_to_cpu(de->ino);
+		u16 child_name_len = le16_to_cpu(de->name_len);
 
-		if (parent_ino > info->base_inode_count)
-			return false;
-
-		parent_raw = &info->base_inodes[parent_ino - 1];
-		child_ino = le32_to_cpu(parent_raw->first_child);
-
-		while (child_ino && child_ino <= info->base_inode_count) {
-			struct daxfs_base_inode *child = &info->base_inodes[child_ino - 1];
-			char *child_name = info->base_strtab +
-					   le32_to_cpu(child->name_offset);
-			u32 child_name_len = le32_to_cpu(child->name_len);
-
-			if (namelen == child_name_len &&
-			    memcmp(name, child_name, namelen) == 0) {
-				/* Check if deleted in delta */
-				for (b = info->current_branch; b; b = b->parent) {
-					if (daxfs_delta_is_deleted(b, child_ino))
-						return false;
-				}
-				if (ino_out)
-					*ino_out = child_ino;
-				return true;
+		if (namelen == child_name_len &&
+		    memcmp(name, de->name, namelen) == 0) {
+			/* Check if deleted in delta */
+			for (b = info->current_branch; b; b = b->parent) {
+				if (daxfs_delta_is_deleted(b, child_ino))
+					return false;
 			}
-
-			child_ino = le32_to_cpu(child->next_sibling);
+			if (ino_out)
+				*ino_out = child_ino;
+			return true;
 		}
 	}
 
@@ -381,14 +401,16 @@ static int daxfs_iterate(struct file *file, struct dir_context *ctx)
 
 	/* First emit entries from base image (if not deleted) */
 	if (info->base_inodes && dir->i_ino <= info->base_inode_count) {
-		struct daxfs_base_inode *dir_raw = &info->base_inodes[dir->i_ino - 1];
-		u32 child_ino = le32_to_cpu(dir_raw->first_child);
+		struct daxfs_dirent *dirents;
+		u32 dirent_count, i;
 
-		while (child_ino && child_ino <= info->base_inode_count) {
-			struct daxfs_base_inode *child = &info->base_inodes[child_ino - 1];
+		dirents = daxfs_get_base_dirents(info, dir->i_ino, &dirent_count);
+		for (i = 0; i < dirent_count; i++) {
+			struct daxfs_dirent *de = &dirents[i];
+			u32 child_ino = le32_to_cpu(de->ino);
+			u16 name_len = le16_to_cpu(de->name_len);
+			u32 mode = le32_to_cpu(de->mode);
 			bool deleted = false;
-			char *name;
-			u32 name_len, mode;
 			unsigned char dtype;
 
 			/* Check if deleted in any branch */
@@ -401,10 +423,6 @@ static int daxfs_iterate(struct file *file, struct dir_context *ctx)
 
 			if (!deleted) {
 				if (pos >= ctx->pos) {
-					name = info->base_strtab + le32_to_cpu(child->name_offset);
-					name_len = le32_to_cpu(child->name_len);
-					mode = le32_to_cpu(child->mode);
-
 					switch (mode & S_IFMT) {
 					case S_IFREG: dtype = DT_REG; break;
 					case S_IFDIR: dtype = DT_DIR; break;
@@ -412,13 +430,12 @@ static int daxfs_iterate(struct file *file, struct dir_context *ctx)
 					default: dtype = DT_UNKNOWN; break;
 					}
 
-					if (!dir_emit(ctx, name, name_len, child_ino, dtype))
+					if (!dir_emit(ctx, de->name, name_len, child_ino, dtype))
 						return 0;
 					ctx->pos = pos + 1;
 				}
 				pos++;
 			}
-			child_ino = le32_to_cpu(child->next_sibling);
 		}
 	}
 
@@ -539,29 +556,20 @@ const struct file_operations daxfs_dir_ops = {
 static bool daxfs_name_exists_base(struct daxfs_info *info, u64 parent_ino,
 				   const char *name, int namelen, u64 *ino_out)
 {
-	struct daxfs_base_inode *parent_raw;
-	u32 child_ino;
+	struct daxfs_dirent *dirents;
+	u32 dirent_count, i;
 
-	if (!info->base_inodes || parent_ino > info->base_inode_count)
-		return false;
-
-	parent_raw = &info->base_inodes[parent_ino - 1];
-	child_ino = le32_to_cpu(parent_raw->first_child);
-
-	while (child_ino && child_ino <= info->base_inode_count) {
-		struct daxfs_base_inode *child = &info->base_inodes[child_ino - 1];
-		char *child_name = info->base_strtab +
-				   le32_to_cpu(child->name_offset);
-		u32 child_name_len = le32_to_cpu(child->name_len);
+	dirents = daxfs_get_base_dirents(info, parent_ino, &dirent_count);
+	for (i = 0; i < dirent_count; i++) {
+		struct daxfs_dirent *de = &dirents[i];
+		u16 child_name_len = le16_to_cpu(de->name_len);
 
 		if (namelen == child_name_len &&
-		    memcmp(name, child_name, namelen) == 0) {
+		    memcmp(name, de->name, namelen) == 0) {
 			if (ino_out)
-				*ino_out = child_ino;
+				*ino_out = le32_to_cpu(de->ino);
 			return true;
 		}
-
-		child_ino = le32_to_cpu(child->next_sibling);
 	}
 
 	return false;
@@ -589,30 +597,22 @@ static int daxfs_iterate_ro(struct file *file, struct dir_context *ctx)
 {
 	struct inode *dir = file_inode(file);
 	struct daxfs_info *info = DAXFS_SB(dir->i_sb);
-	struct daxfs_base_inode *dir_raw;
-	u32 child_ino;
+	struct daxfs_dirent *dirents;
+	u32 dirent_count, i;
 	loff_t pos = 2;  /* Start after . and .. */
 
 	if (!dir_emit_dots(file, ctx))
 		return 0;
 
-	if (!info->base_inodes || dir->i_ino > info->base_inode_count)
-		return 0;
-
-	dir_raw = &info->base_inodes[dir->i_ino - 1];
-	child_ino = le32_to_cpu(dir_raw->first_child);
-
-	while (child_ino && child_ino <= info->base_inode_count) {
-		struct daxfs_base_inode *child = &info->base_inodes[child_ino - 1];
-		char *name;
-		u32 name_len, mode;
+	dirents = daxfs_get_base_dirents(info, dir->i_ino, &dirent_count);
+	for (i = 0; i < dirent_count; i++) {
+		struct daxfs_dirent *de = &dirents[i];
+		u32 child_ino = le32_to_cpu(de->ino);
+		u16 name_len = le16_to_cpu(de->name_len);
+		u32 mode = le32_to_cpu(de->mode);
 		unsigned char dtype;
 
 		if (pos >= ctx->pos) {
-			name = info->base_strtab + le32_to_cpu(child->name_offset);
-			name_len = le32_to_cpu(child->name_len);
-			mode = le32_to_cpu(child->mode);
-
 			switch (mode & S_IFMT) {
 			case S_IFREG: dtype = DT_REG; break;
 			case S_IFDIR: dtype = DT_DIR; break;
@@ -620,12 +620,11 @@ static int daxfs_iterate_ro(struct file *file, struct dir_context *ctx)
 			default: dtype = DT_UNKNOWN; break;
 			}
 
-			if (!dir_emit(ctx, name, name_len, child_ino, dtype))
+			if (!dir_emit(ctx, de->name, name_len, child_ino, dtype))
 				return 0;
 			ctx->pos = pos + 1;
 		}
 		pos++;
-		child_ino = le32_to_cpu(child->next_sibling);
 	}
 
 	return 0;
