@@ -19,11 +19,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <mntent.h>
+#include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
 #include <stdbool.h>
 #include <getopt.h>
+#include <daxfs_format.h>
 
 #define PROC_MOUNTS "/proc/mounts"
 
@@ -244,11 +247,61 @@ static int cmd_list(const char *mountpoint)
 	return list_daxfs_mounts();
 }
 
+static int find_any_daxfs_mount(struct mount_info *mi)
+{
+	FILE *fp;
+	struct mntent *ent;
+	int ret = -1;
+
+	fp = setmntent(PROC_MOUNTS, "r");
+	if (!fp)
+		return -1;
+
+	while ((ent = getmntent(fp)) != NULL) {
+		if (strcmp(ent->mnt_type, "daxfs") != 0)
+			continue;
+
+		mi->mountpoint = strdup(ent->mnt_dir);
+		mi->source = strdup(ent->mnt_fsname);
+		mi->fstype = strdup(ent->mnt_type);
+		mi->options = strdup(ent->mnt_opts);
+		mi->phys = parse_option(mi->options, "phys");
+		mi->size = parse_option(mi->options, "size");
+		mi->dmabuf = parse_option(mi->options, "dmabuf");
+		ret = 0;
+		break;
+	}
+
+	endmntent(fp);
+	return ret;
+}
+
+/*
+ * Get dmabuf fd from an existing daxfs mount via ioctl.
+ * Returns fd on success, -1 on failure.
+ */
+static int get_dmabuf_fd(const char *existing_mount)
+{
+	int fd, dmabuf_fd;
+
+	fd = open(existing_mount, O_RDONLY);
+	if (fd < 0) {
+		perror(existing_mount);
+		return -1;
+	}
+
+	dmabuf_fd = ioctl(fd, DAXFS_IOC_GET_DMABUF);
+	close(fd);
+
+	return dmabuf_fd;
+}
+
 static int cmd_create(const char *mountpoint, const char *branch,
 		      const char *parent)
 {
 	struct mount_info mi = {0};
 	char options[512];
+	int dmabuf_fd = -1;
 	int ret;
 
 	if (!branch) {
@@ -261,32 +314,50 @@ static int cmd_create(const char *mountpoint, const char *branch,
 		return 1;
 	}
 
-	if (find_daxfs_mount(mountpoint, &mi) < 0) {
-		fprintf(stderr, "Error: no daxfs mount at '%s'\n", mountpoint);
+	if (!mountpoint) {
+		fprintf(stderr, "Error: mountpoint required (-m)\n");
 		return 1;
 	}
 
-	if (!mi.writable) {
-		fprintf(stderr, "Error: mount is read-only, cannot create branch\n");
-		free_mount_info(&mi);
+	/* Find any existing daxfs mount to get backing store */
+	if (find_any_daxfs_mount(&mi) < 0) {
+		fprintf(stderr, "Error: no existing daxfs mount found\n");
 		return 1;
 	}
 
 	printf("Creating branch '%s' from parent '%s'...\n", branch, parent);
 
-	/* Use remount to create branch (works for both phys and dmabuf) */
-	snprintf(options, sizeof(options), "remount,branch=%s,parent=%s",
-		 branch, parent);
-
-	char *argv[] = {"mount", "-o", options, (char *)mountpoint, NULL};
-	ret = run_mount(argv);
-	if (ret < 0) {
-		fprintf(stderr, "Error: failed to create branch\n");
+	/* Try to get dmabuf fd from existing mount */
+	dmabuf_fd = get_dmabuf_fd(mi.mountpoint);
+	if (dmabuf_fd >= 0) {
+		/* dmabuf-based mount */
+		snprintf(options, sizeof(options), "dmabuf=%d,branch=%s,parent=%s",
+			 dmabuf_fd, branch, parent);
+	} else if (mi.phys && mi.size) {
+		/* phys-based mount */
+		snprintf(options, sizeof(options), "phys=%s,size=%s,branch=%s,parent=%s",
+			 mi.phys, mi.size, branch, parent);
+	} else {
+		fprintf(stderr, "Error: cannot determine backing store\n");
 		free_mount_info(&mi);
 		return 1;
 	}
 
-	printf("Branch '%s' created and switched at '%s'\n", branch, mountpoint);
+	/* Note: dmabuf_fd is inherited by forked child, so fd number stays valid */
+	char *argv[] = {"mount", "-t", "daxfs", "-o", options, "none",
+			(char *)mountpoint, NULL};
+	ret = run_mount(argv);
+
+	if (dmabuf_fd >= 0)
+		close(dmabuf_fd);
+
+	if (ret < 0) {
+		fprintf(stderr, "Error: failed to mount branch\n");
+		free_mount_info(&mi);
+		return 1;
+	}
+
+	printf("Branch '%s' mounted at '%s'\n", branch, mountpoint);
 	free_mount_info(&mi);
 	return 0;
 }
@@ -366,19 +437,19 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "Usage: %s <command> [options]\n", prog);
 	fprintf(stderr, "\nCommands:\n");
 	fprintf(stderr, "  list              List daxfs mounts or show mount info\n");
-	fprintf(stderr, "  create NAME       Create a new branch from parent\n");
+	fprintf(stderr, "  create NAME       Create a new branch and mount it\n");
 	fprintf(stderr, "  commit            Commit current branch to parent\n");
 	fprintf(stderr, "  abort             Abort current branch (discard changes)\n");
 	fprintf(stderr, "\nOptions:\n");
-	fprintf(stderr, "  -m, --mount PATH  Mountpoint (required for most commands)\n");
-	fprintf(stderr, "  -p, --parent NAME Parent branch (required for create)\n");
+	fprintf(stderr, "  -m, --mount PATH  Mountpoint for the branch\n");
+	fprintf(stderr, "  -p, --parent NAME Parent branch name (required for create)\n");
 	fprintf(stderr, "  -h, --help        Show this help\n");
 	fprintf(stderr, "\nExamples:\n");
 	fprintf(stderr, "  %s list\n", prog);
-	fprintf(stderr, "  %s list -m /mnt\n", prog);
-	fprintf(stderr, "  %s create feature -m /mnt -p main\n", prog);
-	fprintf(stderr, "  %s commit -m /mnt\n", prog);
-	fprintf(stderr, "  %s abort -m /mnt\n", prog);
+	fprintf(stderr, "  %s list -m /mnt/main\n", prog);
+	fprintf(stderr, "  %s create feature -m /mnt/feature -p main\n", prog);
+	fprintf(stderr, "  %s commit -m /mnt/feature\n", prog);
+	fprintf(stderr, "  %s abort -m /mnt/feature\n", prog);
 	fprintf(stderr, "\nNote: Use 'daxfs-inspect' to inspect raw image files.\n");
 }
 
@@ -433,10 +504,6 @@ int main(int argc, char *argv[])
 	if (strcmp(command, "list") == 0) {
 		ret = cmd_list(mountpoint);
 	} else if (strcmp(command, "create") == 0) {
-		if (!mountpoint) {
-			fprintf(stderr, "Error: -m/--mount is required\n");
-			return 1;
-		}
 		ret = cmd_create(mountpoint, branch_name, parent);
 	} else if (strcmp(command, "commit") == 0) {
 		if (!mountpoint) {
