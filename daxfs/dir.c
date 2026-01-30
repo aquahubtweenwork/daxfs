@@ -114,6 +114,9 @@ static struct dentry *daxfs_lookup(struct inode *dir, struct dentry *dentry,
 	if (!daxfs_branch_is_valid(info))
 		return ERR_PTR(-ESTALE);
 
+	if (dentry->d_name.len > DAXFS_NAME_MAX)
+		return ERR_PTR(-ENAMETOOLONG);
+
 	if (daxfs_name_exists(sb, dir->i_ino,
 			      dentry->d_name.name, dentry->d_name.len,
 			      &ino)) {
@@ -140,6 +143,9 @@ static int daxfs_create(struct mnt_idmap *idmap, struct inode *dir,
 
 	if (!daxfs_branch_is_valid(info))
 		return -ESTALE;
+
+	if (dentry->d_name.len > DAXFS_NAME_MAX)
+		return -ENAMETOOLONG;
 
 	/* Check if name already exists */
 	if (daxfs_name_exists(sb, dir->i_ino,
@@ -203,6 +209,9 @@ static struct dentry *daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 
 	if (!daxfs_branch_is_valid(info))
 		return ERR_PTR(-ESTALE);
+
+	if (dentry->d_name.len > DAXFS_NAME_MAX)
+		return ERR_PTR(-ENAMETOOLONG);
 
 	/* Check if name already exists */
 	if (daxfs_name_exists(sb, dir->i_ino,
@@ -357,6 +366,9 @@ static int daxfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	if (!daxfs_branch_is_valid(info))
 		return -ESTALE;
 
+	if (dentry->d_name.len > DAXFS_NAME_MAX)
+		return -ENAMETOOLONG;
+
 	/* Check if name already exists */
 	if (daxfs_name_exists(sb, dir->i_ino,
 			      dentry->d_name.name, dentry->d_name.len, NULL))
@@ -430,6 +442,9 @@ static int daxfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 
 	if (!daxfs_branch_is_valid(info))
 		return -ESTALE;
+
+	if (new_dentry->d_name.len > DAXFS_NAME_MAX)
+		return -ENAMETOOLONG;
 
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
@@ -691,6 +706,9 @@ static struct dentry *daxfs_lookup_ro(struct inode *dir, struct dentry *dentry,
 	struct daxfs_info *info = DAXFS_SB(dir->i_sb);
 	struct inode *inode = NULL;
 	u64 ino;
+
+	if (dentry->d_name.len > DAXFS_NAME_MAX)
+		return ERR_PTR(-ENAMETOOLONG);
 
 	if (daxfs_name_exists_base(info, dir->i_ino,
 				   dentry->d_name.name, dentry->d_name.len,
