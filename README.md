@@ -59,31 +59,21 @@ make clean
 
 Requires `CONFIG_FS_DAX` enabled in the target kernel.
 
-## Creating Images
+## Usage
 
 ```bash
-# Create image file
-mkdaxfs -d /path/to/rootfs -o image.daxfs
-
-# Create with branching support (read-write)
-mkdaxfs -d /path/to/rootfs -o image.daxfs -w
-
-# Allocate from DMA heap and mount
+# Create and mount from DMA heap (typical workflow)
 mkdaxfs -d /path/to/rootfs -H /dev/dma_heap/system -s 256M -m /mnt -w
-```
 
-## Mounting
-
-```bash
-# Physical address
-mount -t daxfs -o phys=0x100000000,size=0x10000000 none /mnt
-
-# With validation (for untrusted images)
-mount -t daxfs -o phys=0x100000000,size=0x10000000,validate none /mnt
-
-# Read-write with branching
+# Create at physical address, then mount separately
+mkdaxfs -d /path/to/rootfs -p 0x100000000 -s 256M -w
 mount -t daxfs -o phys=0x100000000,size=0x10000000,rw none /mnt
+
+# Create format blob (copy to DAX memory to mount)
+mkdaxfs -d /path/to/rootfs -o image.daxfs -w
 ```
+
+Mount options: `phys=ADDR`, `size=SIZE`, `rw` (enable branching), `validate` (check untrusted data).
 
 For dma-buf backing, use the new mount API (`fsopen`/`fsconfig`/`fsmount`) with
 `FSCONFIG_SET_FD` to pass the dma-buf fd.
