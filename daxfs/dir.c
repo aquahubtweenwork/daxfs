@@ -107,8 +107,12 @@ static struct dentry *daxfs_lookup(struct inode *dir, struct dentry *dentry,
 				   unsigned int flags)
 {
 	struct super_block *sb = dir->i_sb;
+	struct daxfs_info *info = DAXFS_SB(sb);
 	struct inode *inode = NULL;
 	u64 ino;
+
+	if (!daxfs_branch_is_valid(info))
+		return ERR_PTR(-ESTALE);
 
 	if (daxfs_name_exists(sb, dir->i_ino,
 			      dentry->d_name.name, dentry->d_name.len,
@@ -133,6 +137,9 @@ static int daxfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	size_t entry_size;
 	u64 new_ino;
 	int ret;
+
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
 
 	/* Check if name already exists */
 	if (daxfs_name_exists(sb, dir->i_ino,
@@ -190,6 +197,9 @@ static struct dentry *daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	u64 new_ino;
 	int ret;
 
+	if (!daxfs_branch_is_valid(info))
+		return ERR_PTR(-ESTALE);
+
 	/* Check if name already exists */
 	if (daxfs_name_exists(sb, dir->i_ino,
 			      dentry->d_name.name, dentry->d_name.len, NULL))
@@ -242,6 +252,9 @@ static int daxfs_unlink(struct inode *dir, struct dentry *dentry)
 	size_t entry_size;
 	int ret;
 
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
+
 	del.parent_ino = cpu_to_le64(dir->i_ino);
 	del.name_len = cpu_to_le16(dentry->d_name.len);
 	del.flags = 0;
@@ -267,6 +280,11 @@ static int daxfs_unlink(struct inode *dir, struct dentry *dentry)
 
 static int daxfs_rmdir(struct inode *dir, struct dentry *dentry)
 {
+	struct daxfs_info *info = DAXFS_SB(dir->i_sb);
+
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
+
 	/* TODO: Check if directory is empty */
 	return daxfs_unlink(dir, dentry);
 }
@@ -284,6 +302,9 @@ static int daxfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	size_t target_len;
 	u64 new_ino;
 	int ret;
+
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
 
 	/* Check if name already exists */
 	if (daxfs_name_exists(sb, dir->i_ino,
@@ -351,6 +372,9 @@ static int daxfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	size_t entry_size;
 	int ret;
 
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
+
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
 
@@ -395,6 +419,9 @@ static int daxfs_iterate(struct file *file, struct dir_context *ctx)
 	struct daxfs_info *info = DAXFS_SB(sb);
 	struct daxfs_branch_ctx *branch;
 	loff_t pos = 2;  /* Start after . and .. */
+
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
 
 	if (!dir_emit_dots(file, ctx))
 		return 0;

@@ -18,9 +18,13 @@ static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
 	struct super_block *sb = inode->i_sb;
+	struct daxfs_info *info = DAXFS_SB(sb);
 	loff_t pos = iocb->ki_pos;
 	size_t count = iov_iter_count(to);
 	size_t total = 0;
+
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
 
 	if (pos >= inode->i_size)
 		return 0;
@@ -61,6 +65,9 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	struct daxfs_delta_hdr *hdr;
 	struct daxfs_delta_write *wr;
 	void *data;
+
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
 
 	if (len == 0)
 		return 0;

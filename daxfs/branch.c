@@ -534,6 +534,12 @@ int daxfs_branch_commit(struct daxfs_info *info,
 		daxfs_coord_lock(info);
 	mutex_lock(&info->branch_lock);
 
+	/* Check branch wasn't invalidated by concurrent commit */
+	if (le32_to_cpu(READ_ONCE(branch->on_dax->state)) != DAXFS_BRANCH_ACTIVE) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
+
 	/* Can't commit main branch */
 	if (strcmp(branch->name, "main") == 0) {
 		ret = -EINVAL;
