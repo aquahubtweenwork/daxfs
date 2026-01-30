@@ -489,6 +489,25 @@ long daxfs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	return -ENOTTY;
 }
 
+static int daxfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+	struct inode *inode = file_inode(file);
+	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
+	struct daxfs_branch_ctx *branch = info->current_branch;
+
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
+
+	/*
+	 * For DAX, data is written directly to memory. Sync the delta log
+	 * region to ensure persistence.
+	 */
+	if (branch && branch->delta_log && branch->delta_size > 0)
+		daxfs_mem_sync(info, branch->delta_log, branch->delta_size);
+
+	return 0;
+}
+
 const struct file_operations daxfs_file_ops = {
 	.llseek		= generic_file_llseek,
 	.read_iter	= daxfs_read_iter,
@@ -497,7 +516,7 @@ const struct file_operations daxfs_file_ops = {
 	.open		= daxfs_file_open,
 	.release	= daxfs_file_release,
 	.mmap		= daxfs_file_mmap,
-	.fsync		= generic_file_fsync,
+	.fsync		= daxfs_fsync,
 	.unlocked_ioctl	= daxfs_ioctl,
 };
 
@@ -628,6 +647,7 @@ const struct file_operations daxfs_file_ops_ro = {
 	.read_iter	= daxfs_read_iter_ro,
 	.splice_read	= filemap_splice_read,
 	.mmap		= daxfs_file_mmap_ro,
+	.fsync		= noop_fsync,
 	.unlocked_ioctl	= daxfs_ioctl,
 };
 
