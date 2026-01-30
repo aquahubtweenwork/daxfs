@@ -189,6 +189,8 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 
 		i_size_write(inode, attr->ia_size);
 		DAXFS_I(inode)->delta_size = attr->ia_size;
+		inode_set_mtime_to_ts(inode,
+			inode_set_ctime_to_ts(inode, current_time(inode)));
 	}
 
 	/* Handle mode/uid/gid changes */

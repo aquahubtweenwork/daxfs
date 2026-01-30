@@ -180,6 +180,10 @@ static int daxfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (IS_ERR(inode))
 		return PTR_ERR(inode);
 
+	/* Update parent directory timestamps */
+	inode_set_mtime_to_ts(dir,
+		inode_set_ctime_to_ts(dir, current_time(dir)));
+
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -237,6 +241,11 @@ static struct dentry *daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		return ERR_CAST(inode);
 
 	inc_nlink(dir);
+
+	/* Update parent directory timestamps */
+	inode_set_mtime_to_ts(dir,
+		inode_set_ctime_to_ts(dir, current_time(dir)));
+
 	d_instantiate(dentry, inode);
 	return NULL;
 }
@@ -275,6 +284,12 @@ static int daxfs_unlink(struct inode *dir, struct dentry *dentry)
 		return ret;
 
 	drop_nlink(inode);
+	inode_set_ctime_current(inode);
+
+	/* Update parent directory timestamps */
+	inode_set_mtime_to_ts(dir,
+		inode_set_ctime_to_ts(dir, current_time(dir)));
+
 	return 0;
 }
 
@@ -355,6 +370,10 @@ static int daxfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	inode->i_link = daxfs_delta_get_symlink(branch, new_ino);
 	inode->i_size = target_len;
 
+	/* Update parent directory timestamps */
+	inode_set_mtime_to_ts(dir,
+		inode_set_ctime_to_ts(dir, current_time(dir)));
+
 	d_instantiate(dentry, inode);
 	return 0;
 }
@@ -408,8 +427,21 @@ static int daxfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	ret = daxfs_delta_append(branch, DAXFS_DELTA_RENAME, inode->i_ino,
 				 entry_data, entry_size);
 	kfree(entry_data);
+	if (ret)
+		return ret;
 
-	return ret;
+	/* Update inode ctime */
+	inode_set_ctime_current(inode);
+
+	/* Update directory timestamps */
+	inode_set_mtime_to_ts(old_dir,
+		inode_set_ctime_to_ts(old_dir, current_time(old_dir)));
+	if (new_dir != old_dir) {
+		inode_set_mtime_to_ts(new_dir,
+			inode_set_ctime_to_ts(new_dir, current_time(new_dir)));
+	}
+
+	return 0;
 }
 
 static int daxfs_iterate(struct file *file, struct dir_context *ctx)
