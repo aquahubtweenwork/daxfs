@@ -422,6 +422,7 @@ static int daxfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	struct daxfs_info *info = DAXFS_SB(sb);
 	struct daxfs_branch_ctx *branch = info->current_branch;
 	struct inode *inode = d_inode(old_dentry);
+	struct inode *target = d_inode(new_dentry);
 	struct daxfs_delta_rename rn;
 	char *entry_data;
 	size_t entry_size;
@@ -433,13 +434,26 @@ static int daxfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	if (flags & ~RENAME_NOREPLACE)
 		return -EINVAL;
 
-	/* Check if target exists */
-	if (daxfs_name_exists(sb, new_dir->i_ino,
-			      new_dentry->d_name.name,
-			      new_dentry->d_name.len, NULL)) {
+	/* Handle overwrite case */
+	if (target) {
 		if (flags & RENAME_NOREPLACE)
 			return -EEXIST;
-		/* TODO: Handle overwrite case */
+
+		/* Type compatibility checks */
+		if (S_ISDIR(inode->i_mode)) {
+			if (!S_ISDIR(target->i_mode))
+				return -ENOTDIR;
+			if (!daxfs_dir_is_empty(sb, target->i_ino))
+				return -ENOTEMPTY;
+		} else {
+			if (S_ISDIR(target->i_mode))
+				return -EISDIR;
+		}
+
+		/* Remove the target first */
+		ret = daxfs_unlink(new_dir, new_dentry);
+		if (ret)
+			return ret;
 	}
 
 	rn.old_parent_ino = cpu_to_le64(old_dir->i_ino);
