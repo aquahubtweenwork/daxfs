@@ -57,7 +57,7 @@ bool daxfs_branch_is_valid(struct daxfs_info *info)
 }
 
 /*
- * Find a branch by name in the active branches list
+ * Find a branch by name in the active branches list (in-memory only)
  */
 struct daxfs_branch_ctx *daxfs_find_branch_by_name(struct daxfs_info *info,
 						   const char *name)
@@ -67,6 +67,48 @@ struct daxfs_branch_ctx *daxfs_find_branch_by_name(struct daxfs_info *info,
 	list_for_each_entry(branch, &info->active_branches, list) {
 		if (strcmp(branch->name, name) == 0)
 			return branch;
+	}
+	return NULL;
+}
+
+/*
+ * Find a branch slot by name in the on-DAX branch table
+ */
+static struct daxfs_branch *find_branch_slot_by_name(struct daxfs_info *info,
+						     const char *name)
+{
+	u32 i;
+
+	for (i = 0; i < info->branch_table_entries; i++) {
+		struct daxfs_branch *slot = &info->branch_table[i];
+		u32 state = le32_to_cpu(slot->state);
+
+		if (state == DAXFS_BRANCH_FREE)
+			continue;
+		if (state == DAXFS_BRANCH_COMMITTED)
+			continue;
+		if (strncmp(slot->name, name, sizeof(slot->name)) == 0)
+			return slot;
+	}
+	return NULL;
+}
+
+/*
+ * Find a branch slot by ID in the on-DAX branch table
+ */
+static struct daxfs_branch *find_branch_slot_by_id(struct daxfs_info *info,
+						   u64 id)
+{
+	u32 i;
+
+	for (i = 0; i < info->branch_table_entries; i++) {
+		struct daxfs_branch *slot = &info->branch_table[i];
+		u32 state = le32_to_cpu(slot->state);
+
+		if (state == DAXFS_BRANCH_FREE)
+			continue;
+		if (le64_to_cpu(slot->branch_id) == id)
+			return slot;
 	}
 	return NULL;
 }
@@ -110,7 +152,98 @@ static struct daxfs_branch_ctx *alloc_branch_ctx(void)
 }
 
 /*
- * Initialize the "main" branch on first mount
+ * Load a branch from on-DAX table into active_branches.
+ * Recursively loads parent chain if needed.
+ * Caller must hold branch_lock.
+ */
+static struct daxfs_branch_ctx *load_branch_from_dax(struct daxfs_info *info,
+						     struct daxfs_branch *slot)
+{
+	struct daxfs_branch_ctx *ctx;
+	struct daxfs_branch_ctx *parent_ctx = NULL;
+	u64 parent_id;
+	int ret;
+
+	/* Load parent first if exists */
+	parent_id = le64_to_cpu(slot->parent_id);
+	if (parent_id != 0) {
+		struct daxfs_branch *parent_slot;
+
+		parent_slot = find_branch_slot_by_id(info, parent_id);
+		if (!parent_slot) {
+			pr_err("daxfs: parent branch id %llu not found\n", parent_id);
+			return ERR_PTR(-ENOENT);
+		}
+
+		/* Check if parent already loaded */
+		parent_ctx = daxfs_find_branch_by_name(info, parent_slot->name);
+		if (!parent_ctx) {
+			parent_ctx = load_branch_from_dax(info, parent_slot);
+			if (IS_ERR(parent_ctx))
+				return parent_ctx;
+		}
+	}
+
+	/* Create runtime context */
+	ctx = alloc_branch_ctx();
+	if (!ctx)
+		return ERR_PTR(-ENOMEM);
+
+	/* Populate from on-DAX data */
+	ctx->info = info;
+	ctx->branch_id = le64_to_cpu(slot->branch_id);
+	strscpy(ctx->name, slot->name, sizeof(ctx->name));
+	ctx->on_dax = slot;
+	ctx->parent = parent_ctx;
+	ctx->delta_log = daxfs_mem_ptr(info, le64_to_cpu(slot->delta_log_offset));
+	ctx->delta_size = le64_to_cpu(slot->delta_log_size);
+	ctx->delta_capacity = le64_to_cpu(slot->delta_log_capacity);
+	ctx->next_ino = le64_to_cpu(slot->next_local_ino);
+
+	/* Initialize delta index */
+	ret = daxfs_delta_init_branch(info, ctx);
+	if (ret) {
+		kfree(ctx);
+		return ERR_PTR(ret);
+	}
+
+	/* Increment parent refcount */
+	if (parent_ctx)
+		atomic_inc(&parent_ctx->refcount);
+
+	list_add(&ctx->list, &info->active_branches);
+
+	pr_info("daxfs: loaded branch '%s' from DAX\n", ctx->name);
+	return ctx;
+}
+
+/*
+ * Find or load a branch by name.
+ * First checks active_branches, then loads from on-DAX if needed.
+ * Caller must hold branch_lock.
+ */
+static struct daxfs_branch_ctx *find_or_load_branch(struct daxfs_info *info,
+						    const char *name)
+{
+	struct daxfs_branch_ctx *ctx;
+	struct daxfs_branch *slot;
+
+	/* Check if already loaded */
+	ctx = daxfs_find_branch_by_name(info, name);
+	if (ctx)
+		return ctx;
+
+	/* Find in on-DAX table */
+	slot = find_branch_slot_by_name(info, name);
+	if (!slot)
+		return NULL;
+
+	/* Load from DAX */
+	return load_branch_from_dax(info, slot);
+}
+
+/*
+ * Initialize or load the "main" branch
  */
 int daxfs_init_main_branch(struct daxfs_info *info)
 {
@@ -121,13 +254,22 @@ int daxfs_init_main_branch(struct daxfs_info *info)
 
 	mutex_lock(&info->branch_lock);
 
-	/* Check if main already exists */
+	/* Check if main already loaded in memory */
 	if (daxfs_find_branch_by_name(info, "main")) {
 		mutex_unlock(&info->branch_lock);
 		return 0;
 	}
 
-	/* Find free slot */
+	/* Check if main exists in on-DAX table */
+	slot = find_branch_slot_by_name(info, "main");
+	if (slot) {
+		/* Load existing main from DAX */
+		ctx = load_branch_from_dax(info, slot);
+		mutex_unlock(&info->branch_lock);
+		return IS_ERR(ctx) ? PTR_ERR(ctx) : 0;
+	}
+
+	/* Main doesn't exist - create it */
 	slot = find_free_branch_slot(info);
 	if (!slot) {
 		mutex_unlock(&info->branch_lock);
@@ -191,6 +333,25 @@ int daxfs_init_main_branch(struct daxfs_info *info)
 }
 
 /*
+ * Load an existing branch by name.
+ * Loads from on-DAX table if not already in active_branches.
+ * Also loads parent chain.
+ */
+struct daxfs_branch_ctx *daxfs_load_branch(struct daxfs_info *info,
+					   const char *name)
+{
+	struct daxfs_branch_ctx *ctx;
+
+	mutex_lock(&info->branch_lock);
+	ctx = find_or_load_branch(info, name);
+	if (ctx && !IS_ERR(ctx))
+		atomic_inc(&ctx->refcount);
+	mutex_unlock(&info->branch_lock);
+
+	return ctx;
+}
+
+/*
  * Create a new named branch
  */
 int daxfs_branch_create(struct daxfs_info *info, const char *name,
@@ -217,17 +378,22 @@ int daxfs_branch_create(struct daxfs_info *info, const char *name,
 		return -EINVAL;
 	}
 
-	/* Check name not already in use */
-	if (daxfs_find_branch_by_name(info, name)) {
+	/* Check name not already in use (in-memory or on-DAX) */
+	if (daxfs_find_branch_by_name(info, name) ||
+	    find_branch_slot_by_name(info, name)) {
 		mutex_unlock(&info->branch_lock);
 		return -EEXIST;
 	}
 
-	/* Find parent by name */
-	parent = daxfs_find_branch_by_name(info, parent_name);
+	/* Find parent by name (load from on-DAX if needed) */
+	parent = find_or_load_branch(info, parent_name);
 	if (!parent) {
 		mutex_unlock(&info->branch_lock);
 		return -ENOENT;
+	}
+	if (IS_ERR(parent)) {
+		mutex_unlock(&info->branch_lock);
+		return PTR_ERR(parent);
 	}
 
 	/* Find free slot in branch table */
@@ -306,18 +472,62 @@ int daxfs_branch_create(struct daxfs_info *info, const char *name,
 }
 
 /*
- * Commit a branch to its parent
+ * Invalidate all sibling branches (same parent) in on-DAX table.
+ * This affects branches mounted by other processes too.
+ */
+static void invalidate_siblings(struct daxfs_info *info,
+				struct daxfs_branch_ctx *branch)
+{
+	struct daxfs_branch_ctx *sibling;
+	u64 parent_id = le64_to_cpu(branch->on_dax->parent_id);
+	u32 i;
+
+	/* Invalidate siblings in our active_branches list */
+	list_for_each_entry(sibling, &info->active_branches, list) {
+		if (sibling == branch)
+			continue;
+		if (le64_to_cpu(sibling->on_dax->parent_id) != parent_id)
+			continue;
+
+		sibling->on_dax->state = cpu_to_le32(DAXFS_BRANCH_ABORTED);
+		sibling->on_dax->generation = cpu_to_le32(
+			le32_to_cpu(sibling->on_dax->generation) + 1);
+
+		pr_info("daxfs: invalidated sibling branch '%s'\n",
+			sibling->name);
+	}
+
+	/* Invalidate siblings in on-DAX table (for other mounts) */
+	for (i = 0; i < info->branch_table_entries; i++) {
+		struct daxfs_branch *slot = &info->branch_table[i];
+		u32 state = le32_to_cpu(slot->state);
+
+		if (state != DAXFS_BRANCH_ACTIVE)
+			continue;
+		if (le64_to_cpu(slot->branch_id) == branch->branch_id)
+			continue;
+		if (le64_to_cpu(slot->parent_id) != parent_id)
+			continue;
+
+		slot->state = cpu_to_le32(DAXFS_BRANCH_ABORTED);
+		slot->generation = cpu_to_le32(
+			le32_to_cpu(slot->generation) + 1);
+	}
+}
+
+/*
+ * Commit a branch to main (root)
  *
- * This invalidates all sibling branches (branches with the same parent).
- * Sibling mounts will detect this via the fault handler and receive SIGBUS.
+ * Merges deltas from the committing branch all the way up to main.
+ * Invalidates all sibling branches at every level.
+ * All intermediate branches are marked as committed.
  */
 int daxfs_branch_commit(struct daxfs_info *info,
 			struct daxfs_branch_ctx *branch)
 {
-	struct daxfs_branch_ctx *parent, *sibling;
-	u64 parent_id;
+	struct daxfs_branch_ctx *cur, *parent;
 	int ret;
-	u32 i;
+	int committed_count = 0;
 
 	/* Acquire global coordination lock */
 	if (info->coord)
@@ -330,61 +540,63 @@ int daxfs_branch_commit(struct daxfs_info *info,
 		goto out_unlock;
 	}
 
-	parent = branch->parent;
-	if (!parent) {
+	if (!branch->parent) {
 		ret = -EINVAL;
 		goto out_unlock;
 	}
 
-	/* Check no active children */
+	/* Check no active children on the committing branch */
 	if (atomic_read(&branch->refcount) > 1) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
 
-	parent_id = le64_to_cpu(branch->on_dax->parent_id);
-
-	/* Invalidate all sibling branches (same parent, different branch) */
-	list_for_each_entry(sibling, &info->active_branches, list) {
-		if (sibling == branch)
-			continue;
-		if (le64_to_cpu(sibling->on_dax->parent_id) != parent_id)
-			continue;
-
-		/* Mark sibling as aborted */
-		sibling->on_dax->state = cpu_to_le32(DAXFS_BRANCH_ABORTED);
-		sibling->on_dax->generation = cpu_to_le32(
-			le32_to_cpu(sibling->on_dax->generation) + 1);
-
-		pr_info("daxfs: invalidated sibling branch '%s'\n",
-			sibling->name);
-	}
-
 	/*
-	 * Also invalidate sibling branches that may be mounted by other
-	 * processes (not in our active_branches list). Scan the branch table.
+	 * Walk up the parent chain to main, merging deltas at each level.
+	 * Start from the committing branch, merge into parent, repeat.
 	 */
-	for (i = 0; i < info->branch_table_entries; i++) {
-		struct daxfs_branch *slot = &info->branch_table[i];
-		u32 state = le32_to_cpu(slot->state);
+	cur = branch;
+	while (cur->parent != NULL) {
+		parent = cur->parent;
 
-		if (state != DAXFS_BRANCH_ACTIVE)
-			continue;
-		if (le64_to_cpu(slot->branch_id) == branch->branch_id)
-			continue;
-		if (le64_to_cpu(slot->parent_id) != parent_id)
-			continue;
+		/* Invalidate all siblings at this level */
+		invalidate_siblings(info, cur);
 
-		/* Mark as aborted */
-		slot->state = cpu_to_le32(DAXFS_BRANCH_ABORTED);
-		slot->generation = cpu_to_le32(
-			le32_to_cpu(slot->generation) + 1);
+		/* Merge cur's deltas into parent */
+		ret = daxfs_delta_merge(parent, cur);
+		if (ret) {
+			pr_err("daxfs: failed to merge '%s' into '%s'\n",
+			       cur->name, parent->name);
+			goto out_unlock;
+		}
+
+		/* Mark cur as committed */
+		cur->on_dax->state = cpu_to_le32(DAXFS_BRANCH_COMMITTED);
+		memset(cur->on_dax->name, 0, sizeof(cur->on_dax->name));
+		cur->committed = true;
+
+		/* Decrement parent refcount */
+		atomic_dec(&parent->refcount);
+		parent->on_dax->refcount = cpu_to_le32(
+			atomic_read(&parent->refcount));
+
+		/* Update superblock */
+		info->super->active_branches = cpu_to_le32(
+			le32_to_cpu(info->super->active_branches) - 1);
+
+		/* Remove from active list */
+		if (!list_empty(&cur->list)) {
+			list_del(&cur->list);
+			INIT_LIST_HEAD(&cur->list);
+		}
+
+		committed_count++;
+		pr_info("daxfs: merged '%s' into '%s'\n",
+			cur->name, parent->name);
+
+		/* Move up to parent for next iteration */
+		cur = parent;
 	}
-
-	/* Merge child's deltas into parent's log */
-	ret = daxfs_delta_merge(parent, branch);
-	if (ret)
-		goto out_unlock;
 
 	/* Update commit sequence */
 	if (info->coord) {
@@ -393,29 +605,11 @@ int daxfs_branch_commit(struct daxfs_info *info,
 		info->coord->last_committed_id = cpu_to_le64(branch->branch_id);
 	}
 
-	/* Mark branch as committed */
-	branch->on_dax->state = cpu_to_le32(DAXFS_BRANCH_COMMITTED);
-	memset(branch->on_dax->name, 0, sizeof(branch->on_dax->name));
-	branch->committed = true;
-
-	/* Decrement parent refcount */
-	atomic_dec(&parent->refcount);
-	parent->on_dax->refcount = cpu_to_le32(atomic_read(&parent->refcount));
-
-	/* Update superblock */
-	info->super->active_branches = cpu_to_le32(
-		le32_to_cpu(info->super->active_branches) - 1);
-
-	/* Remove from active list but don't free yet (still mounted) */
-	list_del(&branch->list);
-	INIT_LIST_HEAD(&branch->list);
-
 	mutex_unlock(&info->branch_lock);
 	if (info->coord)
 		daxfs_coord_unlock(info);
 
-	pr_info("daxfs: committed branch '%s' to '%s'\n",
-		branch->name, parent->name);
+	pr_info("daxfs: committed %d branch(es) to main\n", committed_count);
 	return 0;
 
 out_unlock:
@@ -426,13 +620,40 @@ out_unlock:
 }
 
 /*
- * Abort a branch (discard changes)
- *
- * Open files on this branch will receive SIGBUS on subsequent access
- * via the fault handler's branch validity check.
+ * Abort a single branch level (internal helper)
+ * Caller must hold branch_lock.
  */
-int daxfs_branch_abort(struct daxfs_info *info,
-		       struct daxfs_branch_ctx *branch)
+static void abort_single_branch_locked(struct daxfs_info *info,
+				       struct daxfs_branch_ctx *branch)
+{
+	/* Mark as aborted, increment generation, and clear name */
+	branch->on_dax->state = cpu_to_le32(DAXFS_BRANCH_ABORTED);
+	branch->on_dax->generation = cpu_to_le32(
+		le32_to_cpu(branch->on_dax->generation) + 1);
+	memset(branch->on_dax->name, 0, sizeof(branch->on_dax->name));
+
+	/* Free delta log space */
+	daxfs_mem_free_region(info,
+			      le64_to_cpu(branch->on_dax->delta_log_offset),
+			      le64_to_cpu(branch->on_dax->delta_log_capacity));
+
+	/* Update superblock */
+	info->super->active_branches = cpu_to_le32(
+		le32_to_cpu(info->super->active_branches) - 1);
+
+	/* Remove from active list */
+	if (!list_empty(&branch->list))
+		list_del(&branch->list);
+
+	pr_info("daxfs: aborted branch '%s'\n", branch->name);
+}
+
+/*
+ * Abort a single branch (used by unmount)
+ * Only aborts the current branch, parent chain remains.
+ */
+int daxfs_branch_abort_single(struct daxfs_info *info,
+			      struct daxfs_branch_ctx *branch)
 {
 	struct daxfs_branch_ctx *parent;
 
@@ -452,12 +673,6 @@ int daxfs_branch_abort(struct daxfs_info *info,
 
 	parent = branch->parent;
 
-	/* Mark as aborted, increment generation, and clear name */
-	branch->on_dax->state = cpu_to_le32(DAXFS_BRANCH_ABORTED);
-	branch->on_dax->generation = cpu_to_le32(
-		le32_to_cpu(branch->on_dax->generation) + 1);
-	memset(branch->on_dax->name, 0, sizeof(branch->on_dax->name));
-
 	/* Decrement parent refcount */
 	if (parent) {
 		atomic_dec(&parent->refcount);
@@ -465,26 +680,80 @@ int daxfs_branch_abort(struct daxfs_info *info,
 			atomic_read(&parent->refcount));
 	}
 
-	/* Free delta log space using storage layer */
-	daxfs_mem_free_region(info,
-			      le64_to_cpu(branch->on_dax->delta_log_offset),
-			      le64_to_cpu(branch->on_dax->delta_log_capacity));
-
-	/* Update superblock */
-	info->super->active_branches = cpu_to_le32(
-		le32_to_cpu(info->super->active_branches) - 1);
-
-	/* Remove from active list */
-	if (!list_empty(&branch->list))
-		list_del(&branch->list);
+	abort_single_branch_locked(info, branch);
 
 	mutex_unlock(&info->branch_lock);
 
-	/* Destroy delta index */
+	/* Destroy delta index and free memory */
 	daxfs_delta_destroy_branch(branch);
-
-	pr_info("daxfs: aborted branch '%s'\n", branch->name);
-
 	kfree(branch);
+
+	return 0;
+}
+
+/*
+ * Abort an entire branch chain (discard all changes back to main)
+ *
+ * Walks up from the current branch to main, aborting each level.
+ * This discards the entire speculation chain.
+ *
+ * Note: Unmount only aborts the current level (one branch).
+ * Abort via remount discards the entire chain.
+ */
+int daxfs_branch_abort(struct daxfs_info *info,
+		       struct daxfs_branch_ctx *branch)
+{
+	struct daxfs_branch_ctx *cur, *parent;
+	struct daxfs_branch_ctx *to_free[32];  /* Max depth */
+	int free_count = 0;
+	int i;
+
+	mutex_lock(&info->branch_lock);
+
+	/* Can't abort main branch */
+	if (strcmp(branch->name, "main") == 0) {
+		mutex_unlock(&info->branch_lock);
+		return -EINVAL;
+	}
+
+	/* Check no active children on the starting branch */
+	if (atomic_read(&branch->refcount) > 1) {
+		mutex_unlock(&info->branch_lock);
+		return -EBUSY;
+	}
+
+	/*
+	 * Walk up the parent chain to main, aborting each branch.
+	 */
+	cur = branch;
+	while (cur != NULL && strcmp(cur->name, "main") != 0) {
+		parent = cur->parent;
+
+		/* Decrement parent refcount */
+		if (parent) {
+			atomic_dec(&parent->refcount);
+			parent->on_dax->refcount = cpu_to_le32(
+				atomic_read(&parent->refcount));
+		}
+
+		/* Abort this branch */
+		abort_single_branch_locked(info, cur);
+
+		/* Save for later cleanup (after releasing lock) */
+		if (free_count < 32)
+			to_free[free_count++] = cur;
+
+		cur = parent;
+	}
+
+	mutex_unlock(&info->branch_lock);
+
+	/* Destroy delta indexes and free memory */
+	for (i = 0; i < free_count; i++) {
+		daxfs_delta_destroy_branch(to_free[i]);
+		kfree(to_free[i]);
+	}
+
+	pr_info("daxfs: aborted %d branch(es)\n", free_count);
 	return 0;
 }

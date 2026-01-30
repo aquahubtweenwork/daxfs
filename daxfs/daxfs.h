@@ -229,6 +229,8 @@ extern char *daxfs_delta_get_symlink(struct daxfs_branch_ctx *branch, u64 ino);
 /* branch.c */
 extern struct daxfs_branch_ctx *daxfs_find_branch_by_name(
 	struct daxfs_info *info, const char *name);
+extern struct daxfs_branch_ctx *daxfs_load_branch(struct daxfs_info *info,
+						  const char *name);
 extern int daxfs_branch_create(struct daxfs_info *info, const char *name,
 			       const char *parent_name,
 			       struct daxfs_branch_ctx **out);
@@ -236,6 +238,8 @@ extern int daxfs_branch_commit(struct daxfs_info *info,
 			       struct daxfs_branch_ctx *branch);
 extern int daxfs_branch_abort(struct daxfs_info *info,
 			      struct daxfs_branch_ctx *branch);
+extern int daxfs_branch_abort_single(struct daxfs_info *info,
+				     struct daxfs_branch_ctx *branch);
 extern int daxfs_init_main_branch(struct daxfs_info *info);
 extern bool daxfs_branch_is_valid(struct daxfs_info *info);
 extern bool daxfs_commit_seq_changed(struct daxfs_info *info);

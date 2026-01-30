@@ -423,30 +423,24 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		if (ret)
 			goto err_unmap;
 	} else if (ctx->branch_name) {
-		/* Mount existing branch */
-		branch = daxfs_find_branch_by_name(info, ctx->branch_name);
+		/* Mount existing branch (loads from on-DAX if needed) */
+		branch = daxfs_load_branch(info, ctx->branch_name);
 		if (!branch) {
 			pr_err("daxfs: branch '%s' not found\n",
 			       ctx->branch_name);
 			ret = -ENOENT;
 			goto err_unmap;
 		}
-		atomic_inc(&branch->refcount);
+		if (IS_ERR(branch)) {
+			ret = PTR_ERR(branch);
+			goto err_unmap;
+		}
 	} else {
 		/* Default: mount "main" branch */
+		ret = daxfs_init_main_branch(info);
+		if (ret)
+			goto err_unmap;
 		branch = daxfs_find_branch_by_name(info, "main");
-		if (!branch) {
-			/* First mount - initialize main branch (requires rw) */
-			if (fc->sb_flags & SB_RDONLY) {
-				pr_err("daxfs: first mount requires rw to initialize\n");
-				ret = -EROFS;
-				goto err_unmap;
-			}
-			ret = daxfs_init_main_branch(info);
-			if (ret)
-				goto err_unmap;
-			branch = daxfs_find_branch_by_name(info, "main");
-		}
 		if (!branch) {
 			ret = -EINVAL;
 			goto err_unmap;
@@ -637,7 +631,7 @@ static void daxfs_kill_sb(struct super_block *sb)
 		if (strcmp(branch->name, "main") != 0 && !branch->committed) {
 			pr_info("daxfs: aborting branch '%s' on umount\n",
 				branch->name);
-			daxfs_branch_abort(info, branch);
+			daxfs_branch_abort_single(info, branch);
 		} else {
 			/* Just decrement refcount for main or committed */
 			atomic_dec(&branch->refcount);
