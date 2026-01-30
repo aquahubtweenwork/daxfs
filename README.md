@@ -10,7 +10,7 @@ loads with no page cache, no buffer heads, and no copies.
 
 - **Zero-copy reads** - Direct memory access, no page cache overhead
 - **Security by simplicity** - Flat directory format, bounded validation, no pointer chasing
-- **Copy-on-write branches** - Speculative modifications with commit/abort semantics
+- **N-level speculative branches** - Nested speculation with commit-to-root/abort semantics
 - **Flexible backing** - Physical address, DAX device, or dma-buf
 
 ## Security
@@ -29,6 +29,7 @@ pointer chasing required.
 
 ## Use Cases
 
+- **AI agent speculative execution** - Parallel exploration with single-winner commit
 - **Multikernel** - Shared rootfs across kernel instances
 - **CXL memory pooling** - Common filesystem across CXL-connected hosts
 - **GPU/accelerator** - Zero-copy access to data via dma-buf
@@ -84,24 +85,49 @@ For dma-buf backing, use the new mount API (`fsopen`/`fsconfig`/`fsmount`) with
 
 ## Branching
 
-Branches enable speculative modifications with a single-winner model:
+Branches enable speculative execution with N-level depth and single-winner semantics:
 
 ```bash
-daxfs-branch create feature -m /mnt -p main  # create and switch
-daxfs-branch list -m /mnt                     # list branches
-daxfs-branch commit -m /mnt                   # commit (invalidates siblings)
-daxfs-branch abort -m /mnt                    # abort (discards changes)
+# Mount main branch
+mount -t daxfs -o phys=0x100000000,size=256M none /mnt/main
+
+# Create speculation branch (new mount)
+daxfs-branch create spec1 -m /mnt/spec1 -p main
+
+# Create deeper speculation (N-level)
+daxfs-branch create spec1a -m /mnt/spec1a -p spec1
+
+# List all branches
+daxfs-branch list
+
+# Commit - merges entire chain to main, invalidates all siblings
+daxfs-branch commit -m /mnt/spec1a
+
+# Abort - discards entire chain back to main
+daxfs-branch abort -m /mnt/spec1a
+
+# Unmount - discards only current branch (single-level backtrack)
+umount /mnt/spec1a
 ```
 
-**Per-mount branch views**: Different mounts of the same image can operate on
-different branches simultaneously. Each mount has its own branch context.
+**Per-mount branch views**: Each mount is tied to one branch. To work on a
+different branch, mount it at a different path.
 
-**Sibling invalidation**: Committing a branch invalidates all sibling branches.
-Processes with mmap'd files on invalidated branches receive SIGBUS on access.
-File opens on invalidated branches return ESTALE.
+**N-level speculation**: Branches can be nested arbitrarily deep. Complex tasks
+naturally require deeper speculation trees.
 
-No merge, no parallel long-lived branches - just speculative execution with a
-single winner.
+**Commit semantics**: Commits the entire branch chain to main and invalidates
+ALL sibling branches at every level. Processes with mmap'd files on invalidated
+branches receive SIGBUS. File opens return ESTALE.
+
+**Abort semantics**: Discards the entire branch chain back to main. Does NOT
+affect sibling branches (they continue unaffected).
+
+**Unmount semantics**: Discards only the current branch. Parent chain remains,
+allowing single-level backtracking.
+
+This model is designed for AI agent speculative execution - multiple agents
+explore different paths, one wins (commit), others are discarded.
 
 ### Why not subvolumes?
 
@@ -113,9 +139,11 @@ branches use delta-logs instead:
 | Create | Snapshot tree metadata | Allocate log region |
 | Commit | Diff trees + apply (expensive) | Append deltas to parent (fast) |
 | Abort | Delete snapshot | Discard log region |
+| N-level | Independent trees, complex merge | Chain merges naturally to root |
 
 Speculative execution needs fast commit. Delta-logs give O(deltas) merge; COW subvolumes
-require O(tree) diffing. The delta-log model is purpose-built for speculative branching.
+require O(tree) diffing. The delta-log model is purpose-built for speculative branching
+with N-level depth.
 
 ### Why not existing filesystems for branching?
 
