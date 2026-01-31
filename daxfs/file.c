@@ -25,156 +25,123 @@
  * For writes, we pre-allocate delta entries and map their data areas.
  */
 
-/*
- * Find or allocate a write extent for the given file region.
- * For DAX mmap writes, we pre-allocate the delta entry so we can
- * return a direct mapping to its data area.
- */
-static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
-				    size_t *out_len)
+static struct daxfs_delta_inode_entry *find_inode_entry(
+	struct daxfs_branch_ctx *branch, u64 ino,
+	struct rb_node ***out_link, struct rb_node **out_parent)
 {
-	struct super_block *sb = inode->i_sb;
-	struct daxfs_info *info = DAXFS_SB(sb);
-	struct daxfs_branch_ctx *branch = info->current_branch;
-	size_t entry_size;
-	void *entry;
-	struct daxfs_delta_hdr *hdr;
-	struct daxfs_delta_write *wr;
-	void *data;
-	void *existing_data = NULL;
-	size_t existing_len = 0;
-	struct rb_node **link;
-	struct rb_node *parent;
+	struct rb_node **link = &branch->inode_index.rb_node;
+	struct rb_node *parent = NULL;
 	struct daxfs_delta_inode_entry *ie;
-	struct daxfs_write_extent *extent;
-	unsigned long flags;
-	bool found_inode = false;
 
-	/* First, check if we already have a write extent covering this position */
-	spin_lock_irqsave(&branch->index_lock, flags);
-
-	ie = NULL;
-	link = &branch->inode_index.rb_node;
-	parent = NULL;
 	while (*link) {
 		parent = *link;
 		ie = rb_entry(parent, struct daxfs_delta_inode_entry, rb_node);
-		if (inode->i_ino < ie->ino)
+		if (ino < ie->ino)
 			link = &parent->rb_left;
-		else if (inode->i_ino > ie->ino)
+		else if (ino > ie->ino)
 			link = &parent->rb_right;
-		else {
-			found_inode = true;
-			break;
-		}
+		else
+			return ie;
 	}
 
-	if (found_inode && ie) {
-		/* Check for existing extent at this position */
-		list_for_each_entry(extent, &ie->write_extents, list) {
-			if (pos >= extent->offset &&
-			    pos < extent->offset + extent->len) {
-				/* Found existing extent */
-				u64 data_off = pos - extent->offset;
-				data = extent->data + data_off;
+	if (out_link)
+		*out_link = link;
+	if (out_parent)
+		*out_parent = parent;
+	return NULL;
+}
 
-				/*
-				 * For mmap, data must be page-aligned. If this
-				 * extent is page-aligned, return it directly.
-				 * Otherwise, we'll need to allocate a new
-				 * page-aligned extent and copy the data.
-				 */
-				if (IS_ALIGNED((unsigned long)data, PAGE_SIZE)) {
-					*out_len = min(len, (size_t)(extent->len - data_off));
-					spin_unlock_irqrestore(&branch->index_lock, flags);
-					return data;
-				}
+/*
+ * Find a page-aligned extent covering the given position.
+ * Must be called with branch->index_lock held.
+ * Returns the data pointer if found, or saves non-aligned data for COW.
+ */
+static void *find_aligned_extent(struct daxfs_delta_inode_entry *ie, loff_t pos,
+				 size_t len, size_t *out_len,
+				 void **cow_data, size_t *cow_len)
+{
+	struct daxfs_write_extent *extent;
+	void *data;
 
-				/*
-				 * Existing extent is not page-aligned.
-				 * Save the data for COW below.
-				 */
-				existing_data = data;
-				existing_len = min(len, (size_t)(extent->len - data_off));
-				break;
+	list_for_each_entry(extent, &ie->write_extents, list) {
+		if (pos >= extent->offset &&
+		    pos < extent->offset + extent->len) {
+			u64 data_off = pos - extent->offset;
+			data = extent->data + data_off;
+
+			if (IS_ALIGNED((unsigned long)data, PAGE_SIZE)) {
+				*out_len = min(len, (size_t)(extent->len - data_off));
+				return data;
 			}
+
+			/* Non-aligned extent - save for COW */
+			*cow_data = data;
+			*cow_len = min(len, (size_t)(extent->len - data_off));
+			return NULL;
 		}
 	}
+	return NULL;
+}
 
-	spin_unlock_irqrestore(&branch->index_lock, flags);
+/*
+ * Allocate and initialize a write delta entry.
+ * Returns the data area pointer, or NULL on allocation failure.
+ */
+static void *alloc_write_delta(struct daxfs_info *info,
+			       struct daxfs_branch_ctx *branch,
+			       u64 ino, loff_t pos, size_t len,
+			       struct daxfs_delta_hdr **out_hdr)
+{
+	size_t header_size = sizeof(struct daxfs_delta_hdr) +
+			     sizeof(struct daxfs_delta_write);
+	size_t entry_size;
+	void *entry, *data;
+	struct daxfs_delta_hdr *hdr;
+	struct daxfs_delta_write *wr;
 
-	/*
-	 * No suitable page-aligned extent exists. Get COW source data
-	 * from base image or parent delta if we don't have it already.
-	 */
-	if (!existing_data)
-		existing_data = daxfs_resolve_file_data(sb, inode->i_ino, pos, len,
-							&existing_len);
-
-	/*
-	 * Allocate new delta entry with page-aligned data area.
-	 * This is required for mmap PFN mapping to work correctly.
-	 */
-	{
-		size_t header_size = sizeof(struct daxfs_delta_hdr) +
-				     sizeof(struct daxfs_delta_write);
-		entry = daxfs_delta_alloc_mmap(info, branch, header_size, len,
-					       &data, &entry_size);
-	}
+	entry = daxfs_delta_alloc_mmap(info, branch, header_size, len,
+				       &data, &entry_size);
 	if (!entry)
 		return NULL;
 
-	/* Fill header */
 	hdr = entry;
 	hdr->type = cpu_to_le32(DAXFS_DELTA_WRITE);
 	hdr->total_size = cpu_to_le32(entry_size);
-	hdr->ino = cpu_to_le64(inode->i_ino);
+	hdr->ino = cpu_to_le64(ino);
 	hdr->timestamp = cpu_to_le64(ktime_get_real_ns());
 
-	/* Fill write info */
 	wr = (void *)(hdr + 1);
 	wr->offset = cpu_to_le64(pos);
 	wr->len = cpu_to_le32(len);
 	wr->flags = 0;
 
-	/* Data area is page-aligned, returned by daxfs_delta_alloc_mmap */
+	*out_hdr = hdr;
+	return data;
+}
 
-	/*
-	 * Copy existing data (COW) or zero-fill if no existing data.
-	 * This preserves base image content when mmap writes only
-	 * modify part of a page.
-	 */
-	if (existing_data && existing_len > 0) {
-		memcpy(data, existing_data, min(len, existing_len));
-		/* Zero any remaining bytes beyond existing data */
-		if (existing_len < len)
-			memset(data + existing_len, 0, len - existing_len);
+static void cow_fill_data(void *dst, size_t dst_len,
+			  const void *src, size_t src_len)
+{
+	if (src && src_len > 0) {
+		memcpy(dst, src, min(dst_len, src_len));
+		if (src_len < dst_len)
+			memset(dst + src_len, 0, dst_len - src_len);
 	} else {
-		memset(data, 0, len);
+		memset(dst, 0, dst_len);
 	}
+}
 
-	/* Update inode index */
-	spin_lock_irqsave(&branch->index_lock, flags);
+static void update_write_index(struct daxfs_branch_ctx *branch,
+			       struct inode *inode,
+			       struct daxfs_delta_hdr *hdr,
+			       loff_t pos, size_t len)
+{
+	struct rb_node **link;
+	struct rb_node *parent;
+	struct daxfs_delta_inode_entry *ie;
 
-	if (!found_inode) {
-		/* Need to find/create inode entry again */
-		link = &branch->inode_index.rb_node;
-		parent = NULL;
-		while (*link) {
-			parent = *link;
-			ie = rb_entry(parent, struct daxfs_delta_inode_entry, rb_node);
-			if (inode->i_ino < ie->ino)
-				link = &parent->rb_left;
-			else if (inode->i_ino > ie->ino)
-				link = &parent->rb_right;
-			else {
-				found_inode = true;
-				break;
-			}
-		}
-	}
-
-	if (found_inode && ie) {
+	ie = find_inode_entry(branch, inode->i_ino, &link, &parent);
+	if (ie) {
 		ie->hdr = hdr;
 		if (pos + len > ie->size)
 			ie->size = pos + len;
@@ -191,13 +158,54 @@ static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
 			rb_insert_color(&ie->rb_node, &branch->inode_index);
 		}
 	}
+}
 
+/*
+ * Find or allocate a write extent for the given file region.
+ * For DAX mmap writes, we pre-allocate the delta entry so we can
+ * return a direct mapping to its data area.
+ */
+static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
+				    size_t *out_len)
+{
+	struct super_block *sb = inode->i_sb;
+	struct daxfs_info *info = DAXFS_SB(sb);
+	struct daxfs_branch_ctx *branch = info->current_branch;
+	struct daxfs_delta_inode_entry *ie;
+	struct daxfs_delta_hdr *hdr;
+	void *data;
+	void *cow_data = NULL;
+	size_t cow_len = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&branch->index_lock, flags);
+	ie = find_inode_entry(branch, inode->i_ino, NULL, NULL);
+	if (ie) {
+		data = find_aligned_extent(ie, pos, len, out_len,
+					   &cow_data, &cow_len);
+		if (data) {
+			spin_unlock_irqrestore(&branch->index_lock, flags);
+			return data;
+		}
+	}
 	spin_unlock_irqrestore(&branch->index_lock, flags);
 
-	/* Add write extent */
+	if (!cow_data)
+		cow_data = daxfs_resolve_file_data(sb, inode->i_ino, pos, len,
+						   &cow_len);
+
+	data = alloc_write_delta(info, branch, inode->i_ino, pos, len, &hdr);
+	if (!data)
+		return NULL;
+
+	cow_fill_data(data, len, cow_data, cow_len);
+
+	spin_lock_irqsave(&branch->index_lock, flags);
+	update_write_index(branch, inode, hdr, pos, len);
+	spin_unlock_irqrestore(&branch->index_lock, flags);
+
 	daxfs_index_add_write_extent(branch, inode->i_ino, pos, len, data);
 
-	/* Update inode size if extending */
 	if (pos + len > inode->i_size) {
 		inode->i_size = pos + len;
 		DAXFS_I(inode)->delta_size = inode->i_size;
@@ -411,49 +419,15 @@ static ssize_t daxfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 		DAXFS_I(inode)->delta_size = inode->i_size;
 	}
 
-	/* Manually update index for this write */
+	/* Update inode index */
 	{
-		struct rb_node **link = &branch->inode_index.rb_node;
-		struct rb_node *parent = NULL;
-		struct daxfs_delta_inode_entry *ie;
 		unsigned long flags;
 
 		spin_lock_irqsave(&branch->index_lock, flags);
-
-		while (*link) {
-			parent = *link;
-			ie = rb_entry(parent, struct daxfs_delta_inode_entry,
-				      rb_node);
-
-			if (inode->i_ino < ie->ino)
-				link = &parent->rb_left;
-			else if (inode->i_ino > ie->ino)
-				link = &parent->rb_right;
-			else {
-				/* Update existing */
-				ie->hdr = hdr;
-				if (pos + len > ie->size)
-					ie->size = pos + len;
-				spin_unlock_irqrestore(&branch->index_lock, flags);
-				goto add_extent;
-			}
-		}
-
-		ie = kzalloc(sizeof(*ie), GFP_ATOMIC);
-		if (ie) {
-			ie->ino = inode->i_ino;
-			ie->hdr = hdr;
-			ie->size = pos + len;
-			ie->mode = inode->i_mode;
-			ie->deleted = false;
-			INIT_LIST_HEAD(&ie->write_extents);
-			rb_link_node(&ie->rb_node, parent, link);
-			rb_insert_color(&ie->rb_node, &branch->inode_index);
-		}
+		update_write_index(branch, inode, hdr, pos, len);
 		spin_unlock_irqrestore(&branch->index_lock, flags);
 	}
 
-add_extent:
 	/* Add write extent for fast data lookup */
 	daxfs_index_add_write_extent(branch, inode->i_ino, pos, len, data);
 
