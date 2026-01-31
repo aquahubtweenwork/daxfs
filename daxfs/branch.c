@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/writeback.h>
+#include <linux/mm.h>
 #include "daxfs.h"
 
 #define INITIAL_DELTA_SIZE	(64 * 1024)	/* 64KB initial delta log */
@@ -54,6 +55,40 @@ bool daxfs_branch_is_valid(struct daxfs_info *info)
 
 	state = le32_to_cpu(READ_ONCE(branch->on_dax->state));
 	return state == DAXFS_BRANCH_ACTIVE;
+}
+
+/*
+ * Invalidate all DAX mappings for this mount.
+ *
+ * Called when the current branch becomes invalid (e.g., sibling committed).
+ * Unmaps all file pages so next access will fault and get SIGBUS.
+ */
+void daxfs_invalidate_branch_mappings(struct daxfs_info *info)
+{
+	struct super_block *sb = info->sb;
+	struct inode *inode;
+
+	if (!sb)
+		return;
+
+	/*
+	 * Iterate over all inodes and unmap their address spaces.
+	 * This tears down existing PFN mappings, forcing new faults
+	 * which will check branch validity and return SIGBUS.
+	 */
+	spin_lock(&sb->s_inode_list_lock);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		if (!S_ISREG(inode->i_mode))
+			continue;
+
+		spin_unlock(&sb->s_inode_list_lock);
+
+		/* Unmap entire file range */
+		unmap_mapping_range(inode->i_mapping, 0, 0, 1);
+
+		spin_lock(&sb->s_inode_list_lock);
+	}
+	spin_unlock(&sb->s_inode_list_lock);
 }
 
 /*

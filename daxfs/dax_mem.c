@@ -13,6 +13,7 @@
 #include <linux/io.h>
 #include <linux/slab.h>
 #include <linux/dma-buf.h>
+#include <linux/mm.h>
 #include "daxfs.h"
 
 /**
@@ -137,15 +138,34 @@ u64 daxfs_mem_offset(struct daxfs_info *info, void *ptr)
  * @offset: byte offset from start of DAX region
  *
  * Returns the physical address corresponding to the given offset.
- * Only valid when mounted via phys/size (not dma-buf).
+ * Works for both physical address mounts and dma-buf mounts.
  *
- * Returns physical address, or 0 if using dma-buf.
+ * Returns physical address, or 0 on failure.
  */
 phys_addr_t daxfs_mem_phys(struct daxfs_info *info, u64 offset)
 {
-	if (info->dmabuf)
+	void *ptr;
+	struct page *page;
+
+	if (offset >= info->size)
 		return 0;
-	return info->phys_addr + offset;
+
+	/* Fast path for physical address mounts */
+	if (info->phys_addr)
+		return info->phys_addr + offset;
+
+	/* For dma-buf mounts, derive physical address from virtual */
+	ptr = info->mem + offset;
+
+	if (is_vmalloc_addr(ptr)) {
+		page = vmalloc_to_page(ptr);
+		if (!page)
+			return 0;
+		return page_to_phys(page) + offset_in_page(ptr);
+	}
+
+	/* Direct-mapped memory */
+	return virt_to_phys(ptr);
 }
 
 /**

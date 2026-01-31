@@ -106,7 +106,10 @@ struct daxfs_info {
 	struct iosys_map dma_map;	/* vmap of dma-buf */
 	char *name;			/* Mount name for identification */
 
-	/* Superblock */
+	/* VFS superblock back-pointer (for inode iteration) */
+	struct super_block *sb;
+
+	/* On-DAX Superblock */
 	struct daxfs_super *super;
 
 	/* Branch management */
@@ -245,6 +248,7 @@ extern int daxfs_branch_abort_single(struct daxfs_info *info,
 extern int daxfs_init_main_branch(struct daxfs_info *info);
 extern bool daxfs_branch_is_valid(struct daxfs_info *info);
 extern bool daxfs_commit_seq_changed(struct daxfs_info *info);
+extern void daxfs_invalidate_branch_mappings(struct daxfs_info *info);
 
 /*
  * ============================================================================

@@ -320,6 +320,7 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	}
 
 	sb->s_fs_info = info;
+	info->sb = sb;
 	sb->s_time_gran = 1;
 
 	/* Validate magic */

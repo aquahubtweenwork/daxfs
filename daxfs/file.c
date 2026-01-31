@@ -9,10 +9,274 @@
 #include <linux/mm.h>
 #include <linux/uio.h>
 #include <linux/pagemap.h>
-#include <linux/highmem.h>
-#include <linux/writeback.h>
 #include <linux/dma-buf.h>
+#include <linux/iomap.h>
+#include <linux/dax.h>
 #include "daxfs.h"
+
+/*
+ * ============================================================================
+ * DAX iomap operations
+ * ============================================================================
+ *
+ * These operations translate file offsets to physical DAX memory addresses.
+ * For reads, we find existing data in delta log or base image.
+ * For writes, we pre-allocate delta entries and map their data areas.
+ */
+
+/*
+ * Find or allocate a write extent for the given file region.
+ * For DAX mmap writes, we pre-allocate the delta entry so we can
+ * return a direct mapping to its data area.
+ */
+static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
+				    size_t *out_len)
+{
+	struct super_block *sb = inode->i_sb;
+	struct daxfs_info *info = DAXFS_SB(sb);
+	struct daxfs_branch_ctx *branch = info->current_branch;
+	size_t entry_size;
+	void *entry;
+	struct daxfs_delta_hdr *hdr;
+	struct daxfs_delta_write *wr;
+	void *data;
+	struct rb_node **link;
+	struct rb_node *parent;
+	struct daxfs_delta_inode_entry *ie;
+	struct daxfs_write_extent *extent;
+	unsigned long flags;
+	bool found_inode = false;
+
+	/* First, check if we already have a write extent covering this position */
+	spin_lock_irqsave(&branch->index_lock, flags);
+
+	ie = NULL;
+	link = &branch->inode_index.rb_node;
+	parent = NULL;
+	while (*link) {
+		parent = *link;
+		ie = rb_entry(parent, struct daxfs_delta_inode_entry, rb_node);
+		if (inode->i_ino < ie->ino)
+			link = &parent->rb_left;
+		else if (inode->i_ino > ie->ino)
+			link = &parent->rb_right;
+		else {
+			found_inode = true;
+			break;
+		}
+	}
+
+	if (found_inode && ie) {
+		/* Check for existing extent at this position */
+		list_for_each_entry(extent, &ie->write_extents, list) {
+			if (pos >= extent->offset &&
+			    pos < extent->offset + extent->len) {
+				/* Found existing extent */
+				u64 data_off = pos - extent->offset;
+				data = extent->data + data_off;
+				*out_len = min(len, (size_t)(extent->len - data_off));
+				spin_unlock_irqrestore(&branch->index_lock, flags);
+				return data;
+			}
+		}
+	}
+
+	spin_unlock_irqrestore(&branch->index_lock, flags);
+
+	/* No existing extent, allocate new delta entry */
+	entry_size = sizeof(struct daxfs_delta_hdr) +
+		     sizeof(struct daxfs_delta_write) + len;
+
+	entry = daxfs_delta_alloc(info, branch, entry_size);
+	if (!entry)
+		return NULL;
+
+	/* Fill header */
+	hdr = entry;
+	hdr->type = cpu_to_le32(DAXFS_DELTA_WRITE);
+	hdr->total_size = cpu_to_le32(entry_size);
+	hdr->ino = cpu_to_le64(inode->i_ino);
+	hdr->timestamp = cpu_to_le64(ktime_get_real_ns());
+
+	/* Fill write info */
+	wr = (void *)(hdr + 1);
+	wr->offset = cpu_to_le64(pos);
+	wr->len = cpu_to_le32(len);
+	wr->flags = 0;
+
+	/* Data area follows write header */
+	data = (void *)(wr + 1);
+
+	/* Zero-fill the data area (will be overwritten by mmap writes) */
+	memset(data, 0, len);
+
+	/* Update inode index */
+	spin_lock_irqsave(&branch->index_lock, flags);
+
+	if (!found_inode) {
+		/* Need to find/create inode entry again */
+		link = &branch->inode_index.rb_node;
+		parent = NULL;
+		while (*link) {
+			parent = *link;
+			ie = rb_entry(parent, struct daxfs_delta_inode_entry, rb_node);
+			if (inode->i_ino < ie->ino)
+				link = &parent->rb_left;
+			else if (inode->i_ino > ie->ino)
+				link = &parent->rb_right;
+			else {
+				found_inode = true;
+				break;
+			}
+		}
+	}
+
+	if (found_inode && ie) {
+		ie->hdr = hdr;
+		if (pos + len > ie->size)
+			ie->size = pos + len;
+	} else {
+		ie = kzalloc(sizeof(*ie), GFP_ATOMIC);
+		if (ie) {
+			ie->ino = inode->i_ino;
+			ie->hdr = hdr;
+			ie->size = pos + len;
+			ie->mode = inode->i_mode;
+			ie->deleted = false;
+			INIT_LIST_HEAD(&ie->write_extents);
+			rb_link_node(&ie->rb_node, parent, link);
+			rb_insert_color(&ie->rb_node, &branch->inode_index);
+		}
+	}
+
+	spin_unlock_irqrestore(&branch->index_lock, flags);
+
+	/* Add write extent */
+	daxfs_index_add_write_extent(branch, inode->i_ino, pos, len, data);
+
+	/* Update inode size if extending */
+	if (pos + len > inode->i_size) {
+		inode->i_size = pos + len;
+		DAXFS_I(inode)->delta_size = inode->i_size;
+	}
+
+	*out_len = len;
+	return data;
+}
+
+/*
+ * iomap_begin for DAX operations
+ *
+ * Translates file offset to physical memory address:
+ * - For reads: finds data in delta log or base image
+ * - For writes: pre-allocates delta entry and returns its data area
+ */
+static int daxfs_iomap_begin(struct inode *inode, loff_t pos, loff_t length,
+			     unsigned flags, struct iomap *iomap,
+			     struct iomap *srcmap)
+{
+	struct super_block *sb = inode->i_sb;
+	struct daxfs_info *info = DAXFS_SB(sb);
+	void *data;
+	size_t data_len;
+	phys_addr_t phys;
+	loff_t file_size = inode->i_size;
+
+	if (!daxfs_branch_is_valid(info))
+		return -ESTALE;
+
+	iomap->bdev = NULL;
+	iomap->dax_dev = NULL;
+
+	if (flags & IOMAP_WRITE) {
+		/* Write fault - allocate delta entry */
+		loff_t alloc_pos, alloc_len;
+
+		/* Align to page boundaries for mmap */
+		alloc_pos = pos & ~(loff_t)(PAGE_SIZE - 1);
+		alloc_len = PAGE_SIZE;
+
+		/* Extend file size if writing beyond current size */
+		if (alloc_pos + alloc_len > file_size)
+			file_size = alloc_pos + alloc_len;
+
+		data = daxfs_get_write_extent(inode, alloc_pos, alloc_len, &data_len);
+		if (!data)
+			return -ENOSPC;
+
+		phys = daxfs_mem_phys(info, daxfs_mem_offset(info, data));
+		if (!phys)
+			return -EIO;
+
+		iomap->type = IOMAP_MAPPED;
+		iomap->flags = IOMAP_F_DIRTY;
+		iomap->offset = alloc_pos;
+		iomap->length = data_len;
+		iomap->addr = phys;
+	} else {
+		/* Read fault - find existing data */
+		if (pos >= file_size) {
+			/* Beyond EOF - return hole */
+			iomap->type = IOMAP_HOLE;
+			iomap->offset = pos;
+			iomap->length = length;
+			iomap->addr = IOMAP_NULL_ADDR;
+			return 0;
+		}
+
+		/* Try to find data in delta log or base image */
+		data = daxfs_resolve_file_data(sb, inode->i_ino, pos, length, &data_len);
+		if (!data || data_len == 0) {
+			/* No data - return hole (zeroed) */
+			iomap->type = IOMAP_HOLE;
+			iomap->offset = pos;
+			iomap->length = min((loff_t)length, file_size - pos);
+			iomap->addr = IOMAP_NULL_ADDR;
+			return 0;
+		}
+
+		phys = daxfs_mem_phys(info, daxfs_mem_offset(info, data));
+		if (!phys)
+			return -EIO;
+
+		iomap->type = IOMAP_MAPPED;
+		iomap->flags = 0;
+		iomap->offset = pos;
+		iomap->length = data_len;
+		iomap->addr = phys;
+	}
+
+	return 0;
+}
+
+static int daxfs_iomap_end(struct inode *inode, loff_t pos, loff_t length,
+			   ssize_t written, unsigned flags, struct iomap *iomap)
+{
+	/* Update mtime on writes */
+	if ((flags & IOMAP_WRITE) && written > 0)
+		inode_set_mtime_to_ts(inode,
+			inode_set_ctime_to_ts(inode, current_time(inode)));
+	return 0;
+}
+
+static const struct iomap_ops daxfs_iomap_ops = {
+	.iomap_begin	= daxfs_iomap_begin,
+	.iomap_end	= daxfs_iomap_end,
+};
+
+/*
+ * For DAX, we don't use the page cache, so address_space_operations
+ * are minimal. This is still needed because the VFS expects a_ops.
+ */
+const struct address_space_operations daxfs_aops = {
+	/* Empty - DAX bypasses page cache */
+};
+
+/*
+ * ============================================================================
+ * File read/write operations
+ * ============================================================================
+ */
 
 static ssize_t daxfs_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
@@ -150,14 +414,6 @@ add_extent:
 	/* Add write extent for fast data lookup */
 	daxfs_index_add_write_extent(branch, inode->i_ino, pos, len, data);
 
-	/*
-	 * Invalidate page cache for the written range. This ensures mmap
-	 * readers see the new data from the delta log, not stale cached pages.
-	 */
-	invalidate_inode_pages2_range(inode->i_mapping,
-				      pos >> PAGE_SHIFT,
-				      (pos + len - 1) >> PAGE_SHIFT);
-
 	iocb->ki_pos = pos + len;
 	inode_set_mtime_to_ts(inode, inode_set_ctime_to_ts(inode, current_time(inode)));
 	return len;
@@ -220,167 +476,147 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	return 0;
 }
 
-static int daxfs_read_folio(struct file *file, struct folio *folio)
+/*
+ * ============================================================================
+ * DAX mmap fault handling
+ * ============================================================================
+ *
+ * We implement our own fault handler that directly inserts PFN mappings.
+ * This bypasses the need for a dax_device structure.
+ */
+
+/*
+ * DAX fault handler - maps DAX memory directly into userspace.
+ * No page cache involved.
+ */
+static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 {
-	struct inode *inode = folio->mapping->host;
-	struct super_block *sb = inode->i_sb;
-	loff_t pos = folio_pos(folio);
-	size_t len = folio_size(folio);
-	size_t filled = 0;
-
-	if (pos >= inode->i_size) {
-		folio_zero_range(folio, 0, len);
-		goto out;
-	}
-
-	while (filled < len && pos + filled < inode->i_size) {
-		size_t chunk;
-		void *src;
-
-		src = daxfs_resolve_file_data(sb, inode->i_ino,
-					      pos + filled, len - filled, &chunk);
-		if (!src || chunk == 0) {
-			/* Hole or EOF */
-			break;
-		}
-
-		memcpy_to_folio(folio, filled, src, chunk);
-		filled += chunk;
-	}
-
-	if (filled < len)
-		folio_zero_range(folio, filled, len - filled);
-
-out:
-	folio_mark_uptodate(folio);
-	folio_unlock(folio);
-	return 0;
-}
-
-static int daxfs_write_folio(struct folio *folio, struct writeback_control *wbc)
-{
-	struct inode *inode = folio->mapping->host;
+	struct vm_area_struct *vma = vmf->vma;
+	struct inode *inode = file_inode(vma->vm_file);
 	struct super_block *sb = inode->i_sb;
 	struct daxfs_info *info = DAXFS_SB(sb);
-	struct daxfs_branch_ctx *branch = info->current_branch;
-	loff_t pos = folio_pos(folio);
-	size_t len = folio_size(folio);
-	size_t entry_size;
-	void *entry;
-	struct daxfs_delta_hdr *hdr;
-	struct daxfs_delta_write *wr;
+	loff_t pos = (loff_t)vmf->pgoff << PAGE_SHIFT;
+	bool is_write = vmf->flags & FAULT_FLAG_WRITE;
 	void *data;
+	size_t data_len;
+	phys_addr_t phys;
+	unsigned long pfn;
+	vm_fault_t ret;
 
-	/* Don't write beyond file size */
-	if (pos >= inode->i_size) {
-		folio_start_writeback(folio);
-		folio_unlock(folio);
-		folio_end_writeback(folio);
-		return 0;
-	}
-
-	if (pos + len > inode->i_size)
-		len = inode->i_size - pos;
-
-	/* Allocate space for delta entry */
-	entry_size = sizeof(struct daxfs_delta_hdr) +
-		     sizeof(struct daxfs_delta_write) + len;
-
-	entry = daxfs_delta_alloc(info, branch, entry_size);
-	if (!entry) {
-		folio_redirty_for_writepage(wbc, folio);
-		folio_unlock(folio);
-		return -ENOSPC;
-	}
-
-	/* Fill header */
-	hdr = entry;
-	hdr->type = cpu_to_le32(DAXFS_DELTA_WRITE);
-	hdr->total_size = cpu_to_le32(entry_size);
-	hdr->ino = cpu_to_le64(inode->i_ino);
-	hdr->timestamp = cpu_to_le64(ktime_get_real_ns());
-
-	/* Fill write info */
-	wr = (void *)(hdr + 1);
-	wr->offset = cpu_to_le64(pos);
-	wr->len = cpu_to_le32(len);
-	wr->flags = 0;
-
-	/* Copy folio data while still locked */
-	data = (void *)(wr + 1);
-	memcpy_from_folio(data, folio, 0, len);
-
-	/* Start writeback and unlock - data copy is complete */
-	folio_start_writeback(folio);
-	folio_unlock(folio);
-
-	/* Update index */
-	{
-		struct rb_node **link = &branch->inode_index.rb_node;
-		struct rb_node *parent = NULL;
-		struct daxfs_delta_inode_entry *ie;
-		unsigned long flags;
-
-		spin_lock_irqsave(&branch->index_lock, flags);
-
-		while (*link) {
-			parent = *link;
-			ie = rb_entry(parent, struct daxfs_delta_inode_entry,
-				      rb_node);
-
-			if (inode->i_ino < ie->ino)
-				link = &parent->rb_left;
-			else if (inode->i_ino > ie->ino)
-				link = &parent->rb_right;
-			else {
-				/* Update existing */
-				ie->hdr = hdr;
-				if (pos + len > ie->size)
-					ie->size = pos + len;
-				spin_unlock_irqrestore(&branch->index_lock, flags);
-				goto add_extent;
-			}
+	/* Check branch validity */
+	if (daxfs_commit_seq_changed(info)) {
+		if (!daxfs_branch_is_valid(info)) {
+			/*
+			 * Branch was invalidated (sibling committed).
+			 * Tear down all mappings so concurrent accesses
+			 * also get SIGBUS.
+			 */
+			daxfs_invalidate_branch_mappings(info);
+			return VM_FAULT_SIGBUS;
 		}
-
-		ie = kzalloc(sizeof(*ie), GFP_ATOMIC);
-		if (ie) {
-			ie->ino = inode->i_ino;
-			ie->hdr = hdr;
-			ie->size = pos + len;
-			ie->mode = inode->i_mode;
-			ie->deleted = false;
-			INIT_LIST_HEAD(&ie->write_extents);
-			rb_link_node(&ie->rb_node, parent, link);
-			rb_insert_color(&ie->rb_node, &branch->inode_index);
-		}
-		spin_unlock_irqrestore(&branch->index_lock, flags);
+		info->cached_commit_seq = le64_to_cpu(info->coord->commit_sequence);
 	}
 
-add_extent:
-	/* Add write extent for fast data lookup */
-	daxfs_index_add_write_extent(branch, inode->i_ino, pos, len, data);
+	if (is_write) {
+		/* Write fault - allocate delta entry */
+		if (sb->s_flags & SB_RDONLY)
+			return VM_FAULT_SIGBUS;
 
-	folio_end_writeback(folio);
-	return 0;
+		sb_start_pagefault(sb);
+		data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
+		sb_end_pagefault(sb);
+
+		if (!data)
+			return VM_FAULT_SIGBUS;
+	} else {
+		/* Read fault - find existing data */
+		if (pos >= inode->i_size)
+			return VM_FAULT_SIGBUS;
+
+		data = daxfs_resolve_file_data(sb, inode->i_ino, pos, PAGE_SIZE, &data_len);
+		if (!data) {
+			/*
+			 * No data at this position (hole). For DAX we need to
+			 * allocate a zero page. Allocate from delta log.
+			 */
+			sb_start_pagefault(sb);
+			data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
+			sb_end_pagefault(sb);
+
+			if (!data)
+				return VM_FAULT_SIGBUS;
+		}
+	}
+
+	/* Get physical address */
+	phys = daxfs_mem_phys(info, daxfs_mem_offset(info, data));
+	if (!phys)
+		return VM_FAULT_SIGBUS;
+
+	pfn = phys >> PAGE_SHIFT;
+
+	/* Insert the PFN mapping */
+	ret = vmf_insert_pfn(vma, vmf->address, pfn);
+
+	return ret;
 }
 
-static int daxfs_writepages(struct address_space *mapping,
-			    struct writeback_control *wbc)
+/*
+ * DAX pfn_mkwrite handler - called to upgrade a write-protected PFN
+ * mapping to writable.
+ */
+static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 {
-	struct folio *folio = NULL;
-	int error = 0;
+	struct vm_area_struct *vma = vmf->vma;
+	struct inode *inode = file_inode(vma->vm_file);
+	struct super_block *sb = inode->i_sb;
+	struct daxfs_info *info = DAXFS_SB(sb);
+	loff_t pos = (loff_t)vmf->pgoff << PAGE_SHIFT;
+	void *data;
+	size_t data_len;
+	phys_addr_t phys;
+	unsigned long pfn;
 
-	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
-		error = daxfs_write_folio(folio, wbc);
+	if (sb->s_flags & SB_RDONLY)
+		return VM_FAULT_SIGBUS;
 
-	return error;
+	if (!daxfs_branch_is_valid(info)) {
+		daxfs_invalidate_branch_mappings(info);
+		return VM_FAULT_SIGBUS;
+	}
+
+	/*
+	 * Need to ensure we have a writable extent. The page might have
+	 * been mapped read-only from base image, now needs to be COW'd
+	 * to delta log.
+	 */
+	sb_start_pagefault(sb);
+	data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
+	sb_end_pagefault(sb);
+
+	if (!data)
+		return VM_FAULT_SIGBUS;
+
+	phys = daxfs_mem_phys(info, daxfs_mem_offset(info, data));
+	if (!phys)
+		return VM_FAULT_SIGBUS;
+
+	pfn = phys >> PAGE_SHIFT;
+
+	/* Re-insert the PFN mapping as writable */
+	return vmf_insert_pfn(vma, vmf->address, pfn);
 }
 
-const struct address_space_operations daxfs_aops = {
-	.read_folio	= daxfs_read_folio,
-	.writepages	= daxfs_writepages,
-	.dirty_folio	= filemap_dirty_folio,
+static const struct vm_operations_struct daxfs_dax_vm_ops = {
+	.fault		= daxfs_dax_fault,
+	.pfn_mkwrite	= daxfs_dax_pfn_mkwrite,
 };
+
+/*
+ * ============================================================================
+ * File operations
+ * ============================================================================
+ */
 
 static int daxfs_file_open(struct inode *inode, struct file *file)
 {
@@ -405,53 +641,8 @@ static int daxfs_file_release(struct inode *inode, struct file *file)
 }
 
 /*
- * Custom fault handler that checks branch validity before faulting in pages.
- * If the branch has been invalidated (e.g., sibling committed), return SIGBUS.
+ * mmap handler - direct DAX mapping
  */
-static vm_fault_t daxfs_fault(struct vm_fault *vmf)
-{
-	struct inode *inode = file_inode(vmf->vma->vm_file);
-	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
-
-	/* Fast path: check commit sequence */
-	if (daxfs_commit_seq_changed(info)) {
-		/* Slow path: full validation */
-		if (!daxfs_branch_is_valid(info))
-			return VM_FAULT_SIGBUS;
-		info->cached_commit_seq = le64_to_cpu(info->coord->commit_sequence);
-	}
-
-	return filemap_fault(vmf);
-}
-
-static vm_fault_t daxfs_page_mkwrite(struct vm_fault *vmf)
-{
-	struct folio *folio = page_folio(vmf->page);
-	struct inode *inode = file_inode(vmf->vma->vm_file);
-	struct daxfs_info *info = DAXFS_SB(inode->i_sb);
-
-	if (inode->i_sb->s_flags & SB_RDONLY)
-		return VM_FAULT_SIGBUS;
-
-	/* Must validate before allowing write */
-	if (!daxfs_branch_is_valid(info))
-		return VM_FAULT_SIGBUS;
-
-	sb_start_pagefault(inode->i_sb);
-	folio_lock(folio);
-	folio_mark_dirty(folio);
-	folio_wait_stable(folio);
-	sb_end_pagefault(inode->i_sb);
-
-	return VM_FAULT_LOCKED;
-}
-
-static const struct vm_operations_struct daxfs_vm_ops = {
-	.fault		= daxfs_fault,
-	.map_pages	= filemap_map_pages,
-	.page_mkwrite	= daxfs_page_mkwrite,
-};
-
 static int daxfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct inode *inode = file_inode(file);
@@ -460,7 +651,11 @@ static int daxfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 		return -EACCES;
 
 	file_accessed(file);
-	vma->vm_ops = &daxfs_vm_ops;
+
+	/* DAX path - direct memory mapping */
+	vm_flags_set(vma, VM_PFNMAP);
+	vma->vm_ops = &daxfs_dax_vm_ops;
+
 	return 0;
 }
 
