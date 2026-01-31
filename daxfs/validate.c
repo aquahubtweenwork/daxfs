@@ -49,7 +49,14 @@ static int daxfs_validate_hardlinks(struct daxfs_info *info)
 
 			for (j = 0; j < num_entries; j++) {
 				u32 child_ino = le32_to_cpu(dirents[j].ino);
-				/* ino is 1-based, refcount is 0-based */
+
+				/* Bounds check - ino is 1-based */
+				if (child_ino < 1 || child_ino > inode_count) {
+					pr_err("daxfs: dir %u entry %u has invalid ino %u\n",
+					       i + 1, j, child_ino);
+					ret = -EINVAL;
+					goto out;
+				}
 				refcount[child_ino - 1]++;
 			}
 		}
