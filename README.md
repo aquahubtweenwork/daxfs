@@ -67,26 +67,28 @@ mkdaxfs -d /path/to/rootfs -H /dev/dma_heap/system -s 256M -m /mnt -w
 
 # Create at physical address, then mount separately
 mkdaxfs -d /path/to/rootfs -p 0x100000000 -s 256M -w
-mount -t daxfs -o phys=0x100000000,size=0x10000000,rw none /mnt
+mount -t daxfs -o phys=0x100000000,size=0x10000000 none /mnt
 
 # Create format blob (copy to DAX memory to mount)
 mkdaxfs -d /path/to/rootfs -o image.daxfs -w
 ```
 
-Mount options: `phys=ADDR`, `size=SIZE`, `rw` (enable branching), `validate` (check untrusted data).
+Mount options: `phys=ADDR`, `size=SIZE`, `validate` (check untrusted data).
 
 For dma-buf backing, use the new mount API (`fsopen`/`fsconfig`/`fsmount`) with
 `FSCONFIG_SET_FD` to pass the dma-buf fd.
 
 ## Branching
 
-Branches enable speculative execution with N-level depth and single-winner semantics:
+Branches enable speculative execution with N-level depth and single-winner semantics.
+
+**Main branch is read-only**. To write, create a child branch:
 
 ```bash
-# Mount main branch
+# Mount main branch (read-only)
 mount -t daxfs -o phys=0x100000000,size=256M none /mnt/main
 
-# Create speculation branch (new mount)
+# Create speculation branch (writable)
 daxfs-branch create spec1 -m /mnt/spec1 -p main
 
 # Create deeper speculation (N-level)

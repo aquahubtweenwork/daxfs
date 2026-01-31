@@ -24,7 +24,6 @@ enum daxfs_param {
 	Opt_parent,
 	Opt_commit,
 	Opt_abort,
-	Opt_rw,
 	Opt_validate,
 };
 
@@ -37,7 +36,6 @@ static const struct fs_parameter_spec daxfs_fs_parameters[] = {
 	fsparam_string("parent", Opt_parent),
 	fsparam_flag("commit", Opt_commit),
 	fsparam_flag("abort", Opt_abort),
-	fsparam_flag("rw", Opt_rw),
 	fsparam_flag("validate", Opt_validate),
 	{}
 };
@@ -51,7 +49,6 @@ struct daxfs_fs_context {
 	char *parent_name;		/* parent branch name */
 	bool commit;			/* remount commit flag */
 	bool do_abort;			/* remount abort flag */
-	bool writable;			/* mount read-write */
 	bool validate;			/* validate image on mount */
 };
 
@@ -100,9 +97,6 @@ static int daxfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_abort:
 		ctx->do_abort = true;
-		break;
-	case Opt_rw:
-		ctx->writable = true;
 		break;
 	case Opt_validate:
 		ctx->validate = true;
@@ -407,18 +401,9 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	info->cached_commit_seq = le64_to_cpu(info->coord->commit_sequence);
 
-	/* Check if read-only was requested via standard VFS flags */
-	if (fc->sb_flags & SB_RDONLY)
-		sb->s_flags |= SB_RDONLY;
-
 	/* Initialize or find branch */
 	if (ctx->branch_name && ctx->parent_name) {
-		/* Create new named branch - requires rw */
-		if (fc->sb_flags & SB_RDONLY) {
-			pr_err("daxfs: creating branch requires rw mount\n");
-			ret = -EROFS;
-			goto err_unmap;
-		}
+		/* Create new named branch - writable */
 		ret = daxfs_branch_create(info, ctx->branch_name,
 					  ctx->parent_name, &branch);
 		if (ret)
@@ -437,7 +422,7 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 			goto err_unmap;
 		}
 	} else {
-		/* Default: mount "main" branch */
+		/* Default: mount "main" branch (read-only) */
 		ret = daxfs_init_main_branch(info);
 		if (ret)
 			goto err_unmap;
@@ -448,6 +433,13 @@ static int daxfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		}
 		atomic_inc(&branch->refcount);
 	}
+
+	/*
+	 * Main branch is always read-only. Only child branches
+	 * (created with branch=name,parent=...) are writable.
+	 */
+	if (!branch->parent)
+		sb->s_flags |= SB_RDONLY;
 
 	info->current_branch = branch;
 
@@ -523,11 +515,6 @@ static int daxfs_reconfigure(struct fs_context *fc)
 		/* Commit current branch to parent and switch to main */
 		struct daxfs_branch_ctx *branch = info->current_branch;
 		struct daxfs_branch_ctx *main_branch;
-
-		if (sb->s_flags & SB_RDONLY) {
-			pr_err("daxfs: commit requires rw mount\n");
-			return -EROFS;
-		}
 
 		if (!branch->parent) {
 			pr_err("daxfs: cannot commit main branch\n");
@@ -688,7 +675,6 @@ static void daxfs_show_branch_path(struct seq_file *m,
 static int daxfs_show_options(struct seq_file *m, struct dentry *root)
 {
 	struct daxfs_info *info = DAXFS_SB(root->d_sb);
-	struct super_block *sb = root->d_sb;
 
 	if (info->name)
 		seq_printf(m, ",name=%s", info->name);
@@ -703,8 +689,6 @@ static int daxfs_show_options(struct seq_file *m, struct dentry *root)
 		seq_puts(m, ",branch=");
 		daxfs_show_branch_path(m, info->current_branch);
 	}
-	if (!(sb->s_flags & SB_RDONLY))
-		seq_puts(m, ",rw");
 	return 0;
 }
 

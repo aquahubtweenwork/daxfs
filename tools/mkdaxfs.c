@@ -496,13 +496,7 @@ static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint,
 		return -1;
 	}
 
-	if (writable) {
-		if (sys_fsconfig(fs_fd, FSCONFIG_SET_FLAG, "rw", NULL, 0) < 0) {
-			perror("fsconfig(FSCONFIG_SET_FLAG, rw)");
-			close(fs_fd);
-			return -1;
-		}
-	}
+	/* Main branch is always read-only; create child branches to write */
 
 	if (validate) {
 		if (sys_fsconfig(fs_fd, FSCONFIG_SET_FLAG, "validate", NULL, 0) < 0) {
