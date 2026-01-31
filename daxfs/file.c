@@ -528,6 +528,27 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  * This bypasses the need for a dax_device structure.
  */
 
+static void daxfs_copy_page(void *dst, const void *src, size_t len)
+{
+	if (src && len > 0) {
+		memcpy(dst, src, min(len, (size_t)PAGE_SIZE));
+		if (len < PAGE_SIZE)
+			memset(dst + len, 0, PAGE_SIZE - len);
+	} else {
+		memset(dst, 0, PAGE_SIZE);
+	}
+}
+
+static unsigned long daxfs_data_to_pfn(struct daxfs_info *info, void *data)
+{
+	phys_addr_t phys;
+
+	if (!data)
+		return 0;
+	phys = daxfs_mem_phys(info, daxfs_mem_offset(info, data));
+	return phys ? (phys >> PAGE_SHIFT) : 0;
+}
+
 /*
  * DAX fault handler - maps DAX memory directly into userspace.
  * No page cache involved.
@@ -545,27 +566,20 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 	struct daxfs_info *info = DAXFS_SB(sb);
 	loff_t pos = (loff_t)vmf->pgoff << PAGE_SHIFT;
 	bool is_write = vmf->flags & FAULT_FLAG_WRITE;
+	bool is_shared = vma->vm_flags & VM_SHARED;
 	void *data;
-	size_t data_len;
-	phys_addr_t phys;
+	size_t len;
 	unsigned long pfn;
-	pgprot_t prot;
 
 	/* Check branch validity */
 	if (daxfs_commit_seq_changed(info)) {
 		if (!daxfs_branch_is_valid(info)) {
-			/*
-			 * Branch was invalidated (sibling committed).
-			 * Tear down all mappings so concurrent accesses
-			 * also get SIGBUS.
-			 */
 			daxfs_invalidate_branch_mappings(info);
 			return VM_FAULT_SIGBUS;
 		}
 		info->cached_commit_seq = le64_to_cpu(info->coord->commit_sequence);
 	}
 
-	/* Check bounds */
 	if (!is_write && pos >= inode->i_size)
 		return VM_FAULT_SIGBUS;
 
@@ -573,40 +587,62 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 		return VM_FAULT_SIGBUS;
 
 	/*
-	 * For mmap, we always need page-aligned data. Use daxfs_get_write_extent
-	 * which allocates page-aligned delta extents and handles COW from base
-	 * image automatically.
-	 *
-	 * For read faults on writable mappings, we allocate writable extents
-	 * so subsequent writes don't need pfn_mkwrite (simpler code path).
-	 *
-	 * For read faults on read-only mappings, we still allocate (for
-	 * alignment), but map read-only.
+	 * MAP_PRIVATE write: copy DAX data to kernel's anonymous page.
+	 * DAX has no struct pages, so we perform COW ourselves.
 	 */
-	sb_start_pagefault(sb);
-	data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
-	sb_end_pagefault(sb);
+	if (is_write && !is_shared) {
+		void *dst;
 
-	if (!data)
-		return VM_FAULT_SIGBUS;
+		if (!vmf->cow_page)
+			return VM_FAULT_SIGBUS;
 
-	/* Get physical address - data is now guaranteed page-aligned */
-	phys = daxfs_mem_phys(info, daxfs_mem_offset(info, data));
-	if (!phys)
-		return VM_FAULT_SIGBUS;
+		data = daxfs_resolve_file_data(sb, inode->i_ino, pos,
+					       PAGE_SIZE, &len);
+		dst = kmap_local_page(vmf->cow_page);
+		daxfs_copy_page(dst, data, len);
+		kunmap_local(dst);
 
-	pfn = phys >> PAGE_SHIFT;
+		return VM_FAULT_DONE_COW;
+	}
 
 	/*
-	 * For write faults, add _PAGE_RW to the protection. vma->vm_page_prot
-	 * may be read-only for shared mappings (kernel dirty tracking).
+	 * MAP_PRIVATE read: map existing DAX data read-only.
 	 */
-	if (is_write)
-		prot = __pgprot(pgprot_val(vma->vm_page_prot) | _PAGE_RW);
-	else
-		prot = vma->vm_page_prot;
+	if (!is_shared) {
+		data = daxfs_resolve_file_data(sb, inode->i_ino, pos,
+					       PAGE_SIZE, &len);
+		pfn = daxfs_data_to_pfn(info, data);
+		if (!pfn)
+			return VM_FAULT_SIGBUS;
 
-	return vmf_insert_pfn_prot(vma, vmf->address, pfn, prot);
+		return vmf_insert_mixed(vma, vmf->address, pfn);
+	}
+
+	/*
+	 * MAP_SHARED: writes go to delta log, reads get existing data
+	 * or allocate zeroed extent.
+	 */
+	if (is_write) {
+		sb_start_pagefault(sb);
+		data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &len);
+		sb_end_pagefault(sb);
+	} else {
+		data = daxfs_resolve_file_data(sb, inode->i_ino, pos,
+					       PAGE_SIZE, &len);
+		if (!data) {
+			sb_start_pagefault(sb);
+			data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &len);
+			sb_end_pagefault(sb);
+		}
+	}
+
+	pfn = daxfs_data_to_pfn(info, data);
+	if (!pfn)
+		return VM_FAULT_SIGBUS;
+
+	return vmf_insert_pfn_prot(vma, vmf->address, pfn,
+		is_write ? __pgprot(pgprot_val(vma->vm_page_prot) | _PAGE_RW)
+			 : vma->vm_page_prot);
 }
 
 /*
@@ -715,8 +751,13 @@ static int daxfs_file_mmap(struct file *file, struct vm_area_struct *vma)
 
 	file_accessed(file);
 
-	/* DAX path - direct memory mapping */
-	vm_flags_set(vma, VM_PFNMAP);
+	if (vma->vm_flags & VM_SHARED) {
+		/* Shared: pure DAX with VM_PFNMAP, writes to delta log */
+		vm_flags_set(vma, VM_PFNMAP);
+	} else {
+		/* Private: VM_MIXEDMAP allows kernel COW for private writes */
+		vm_flags_set(vma, VM_MIXEDMAP);
+	}
 	vma->vm_ops = &daxfs_dax_vm_ops;
 
 	return 0;
