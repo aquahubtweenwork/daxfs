@@ -40,6 +40,8 @@ static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
 	struct daxfs_delta_hdr *hdr;
 	struct daxfs_delta_write *wr;
 	void *data;
+	void *existing_data = NULL;
+	size_t existing_len = 0;
 	struct rb_node **link;
 	struct rb_node *parent;
 	struct daxfs_delta_inode_entry *ie;
@@ -83,7 +85,14 @@ static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
 
 	spin_unlock_irqrestore(&branch->index_lock, flags);
 
-	/* No existing extent, allocate new delta entry */
+	/*
+	 * No existing writable extent. Before allocating, get the existing
+	 * data from base image or parent delta for COW.
+	 */
+	existing_data = daxfs_resolve_file_data(sb, inode->i_ino, pos, len,
+						&existing_len);
+
+	/* Allocate new delta entry */
 	entry_size = sizeof(struct daxfs_delta_hdr) +
 		     sizeof(struct daxfs_delta_write) + len;
 
@@ -107,8 +116,19 @@ static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
 	/* Data area follows write header */
 	data = (void *)(wr + 1);
 
-	/* Zero-fill the data area (will be overwritten by mmap writes) */
-	memset(data, 0, len);
+	/*
+	 * Copy existing data (COW) or zero-fill if no existing data.
+	 * This preserves base image content when mmap writes only
+	 * modify part of a page.
+	 */
+	if (existing_data && existing_len > 0) {
+		memcpy(data, existing_data, min(len, existing_len));
+		/* Zero any remaining bytes beyond existing data */
+		if (existing_len < len)
+			memset(data + existing_len, 0, len - existing_len);
+	} else {
+		memset(data, 0, len);
+	}
 
 	/* Update inode index */
 	spin_lock_irqsave(&branch->index_lock, flags);
@@ -564,6 +584,12 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 /*
  * DAX pfn_mkwrite handler - called to upgrade a write-protected PFN
  * mapping to writable.
+ *
+ * This is the COW path: when a page was initially mapped read-only
+ * (pointing to base image), and the user writes to it, we need to:
+ * 1. Allocate a new delta extent with a copy of the data
+ * 2. Zap the old mapping (which points to base image)
+ * 3. Insert a new writable mapping pointing to delta extent
  */
 static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 {
@@ -586,9 +612,9 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 	}
 
 	/*
-	 * Need to ensure we have a writable extent. The page might have
-	 * been mapped read-only from base image, now needs to be COW'd
-	 * to delta log.
+	 * Allocate writable extent with COW of existing data.
+	 * daxfs_get_write_extent copies existing data from base image
+	 * or parent delta into the new extent.
 	 */
 	sb_start_pagefault(sb);
 	data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
@@ -603,7 +629,15 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 
 	pfn = phys >> PAGE_SHIFT;
 
-	/* Re-insert the PFN mapping as writable */
+	/*
+	 * Zap the old PTE before inserting the new one. The old mapping
+	 * may point to base image (read-only), but we now need to point
+	 * to the delta extent (writable). Without zapping, vmf_insert_pfn
+	 * would fail because a mapping already exists.
+	 */
+	zap_vma_ptes(vma, vmf->address, PAGE_SIZE);
+
+	/* Insert the new PFN mapping pointing to delta extent */
 	return vmf_insert_pfn(vma, vmf->address, pfn);
 }
 
