@@ -111,6 +111,55 @@ void *daxfs_delta_alloc(struct daxfs_info *info,
 }
 
 /*
+ * Allocate space in branch's delta log with page-aligned data area.
+ * Used for mmap extents where the data must be page-aligned for PFN mapping.
+ *
+ * @header_size: size of headers before data
+ * @data_size: size of data (should be PAGE_SIZE for mmap)
+ * @data_out: returns pointer to page-aligned data area
+ * @total_out: if non-NULL, returns total allocation size (for delta header)
+ *
+ * Returns pointer to start of entry (headers), or NULL on failure.
+ */
+void *daxfs_delta_alloc_mmap(struct daxfs_info *info,
+			     struct daxfs_branch_ctx *branch,
+			     size_t header_size, size_t data_size,
+			     void **data_out, size_t *total_out)
+{
+	void *ptr;
+	void *data_start;
+	size_t padding;
+	size_t total_size;
+	u64 new_size;
+
+	spin_lock(&info->alloc_lock);
+
+	ptr = branch->delta_log + branch->delta_size;
+	data_start = ptr + header_size;
+
+	padding = PAGE_ALIGN((unsigned long)data_start) - (unsigned long)data_start;
+
+	total_size = header_size + padding + data_size;
+	new_size = branch->delta_size + total_size;
+
+	if (new_size > branch->delta_capacity) {
+		spin_unlock(&info->alloc_lock);
+		pr_err("daxfs: delta log full for branch '%s'\n", branch->name);
+		return NULL;
+	}
+
+	branch->delta_size = new_size;
+	branch->on_dax->delta_log_size = cpu_to_le64(new_size);
+
+	spin_unlock(&info->alloc_lock);
+
+	*data_out = ptr + header_size + padding;
+	if (total_out)
+		*total_out = total_size;
+	return ptr;
+}
+
+/*
  * Insert or update inode index entry
  */
 static int index_add_inode(struct daxfs_branch_ctx *branch, u64 ino,
@@ -964,8 +1013,22 @@ void *daxfs_lookup_write_extent(struct daxfs_branch_ctx *branch, u64 ino,
 void *daxfs_resolve_file_data(struct super_block *sb, u64 ino,
 			      loff_t pos, size_t len, size_t *out_len)
 {
+	return daxfs_resolve_file_data_ex(sb, ino, pos, len, out_len, NULL);
+}
+
+/*
+ * Extended version that also indicates data source.
+ * @from_base: if non-NULL, set to true if data came from base image
+ */
+void *daxfs_resolve_file_data_ex(struct super_block *sb, u64 ino,
+				 loff_t pos, size_t len, size_t *out_len,
+				 bool *from_base)
+{
 	struct daxfs_info *info = DAXFS_SB(sb);
 	struct daxfs_branch_ctx *b;
+
+	if (from_base)
+		*from_base = false;
 
 	/* Walk branch chain from child to parent looking for write at pos */
 	for (b = info->current_branch; b != NULL; b = b->parent) {
@@ -989,6 +1052,8 @@ void *daxfs_resolve_file_data(struct super_block *sb, u64 ino,
 		*out_len = min(len, (size_t)(file_size - pos));
 		abs_offset = le64_to_cpu(info->super->base_offset) +
 			     data_offset + pos;
+		if (from_base)
+			*from_base = true;
 		return daxfs_mem_ptr((struct daxfs_info *)info, abs_offset);
 	}
 

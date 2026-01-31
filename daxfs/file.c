@@ -12,6 +12,7 @@
 #include <linux/dma-buf.h>
 #include <linux/iomap.h>
 #include <linux/dax.h>
+#include <asm/pgtable.h>
 #include "daxfs.h"
 
 /*
@@ -76,9 +77,26 @@ static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
 				/* Found existing extent */
 				u64 data_off = pos - extent->offset;
 				data = extent->data + data_off;
-				*out_len = min(len, (size_t)(extent->len - data_off));
-				spin_unlock_irqrestore(&branch->index_lock, flags);
-				return data;
+
+				/*
+				 * For mmap, data must be page-aligned. If this
+				 * extent is page-aligned, return it directly.
+				 * Otherwise, we'll need to allocate a new
+				 * page-aligned extent and copy the data.
+				 */
+				if (IS_ALIGNED((unsigned long)data, PAGE_SIZE)) {
+					*out_len = min(len, (size_t)(extent->len - data_off));
+					spin_unlock_irqrestore(&branch->index_lock, flags);
+					return data;
+				}
+
+				/*
+				 * Existing extent is not page-aligned.
+				 * Save the data for COW below.
+				 */
+				existing_data = data;
+				existing_len = min(len, (size_t)(extent->len - data_off));
+				break;
 			}
 		}
 	}
@@ -86,17 +104,23 @@ static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
 	spin_unlock_irqrestore(&branch->index_lock, flags);
 
 	/*
-	 * No existing writable extent. Before allocating, get the existing
-	 * data from base image or parent delta for COW.
+	 * No suitable page-aligned extent exists. Get COW source data
+	 * from base image or parent delta if we don't have it already.
 	 */
-	existing_data = daxfs_resolve_file_data(sb, inode->i_ino, pos, len,
-						&existing_len);
+	if (!existing_data)
+		existing_data = daxfs_resolve_file_data(sb, inode->i_ino, pos, len,
+							&existing_len);
 
-	/* Allocate new delta entry */
-	entry_size = sizeof(struct daxfs_delta_hdr) +
-		     sizeof(struct daxfs_delta_write) + len;
-
-	entry = daxfs_delta_alloc(info, branch, entry_size);
+	/*
+	 * Allocate new delta entry with page-aligned data area.
+	 * This is required for mmap PFN mapping to work correctly.
+	 */
+	{
+		size_t header_size = sizeof(struct daxfs_delta_hdr) +
+				     sizeof(struct daxfs_delta_write);
+		entry = daxfs_delta_alloc_mmap(info, branch, header_size, len,
+					       &data, &entry_size);
+	}
 	if (!entry)
 		return NULL;
 
@@ -113,8 +137,7 @@ static void *daxfs_get_write_extent(struct inode *inode, loff_t pos, size_t len,
 	wr->len = cpu_to_le32(len);
 	wr->flags = 0;
 
-	/* Data area follows write header */
-	data = (void *)(wr + 1);
+	/* Data area is page-aligned, returned by daxfs_delta_alloc_mmap */
 
 	/*
 	 * Copy existing data (COW) or zero-fill if no existing data.
@@ -508,6 +531,11 @@ static int daxfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 /*
  * DAX fault handler - maps DAX memory directly into userspace.
  * No page cache involved.
+ *
+ * For mmap to work correctly with PFN mapping, the data must be
+ * page-aligned. We achieve this by always allocating page-aligned
+ * delta extents for mmap faults, performing COW from base image
+ * if needed.
  */
 static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 {
@@ -521,7 +549,7 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 	size_t data_len;
 	phys_addr_t phys;
 	unsigned long pfn;
-	vm_fault_t ret;
+	pgprot_t prot;
 
 	/* Check branch validity */
 	if (daxfs_commit_seq_changed(info)) {
@@ -537,59 +565,57 @@ static vm_fault_t daxfs_dax_fault(struct vm_fault *vmf)
 		info->cached_commit_seq = le64_to_cpu(info->coord->commit_sequence);
 	}
 
-	if (is_write) {
-		/* Write fault - allocate delta entry */
-		if (sb->s_flags & SB_RDONLY)
-			return VM_FAULT_SIGBUS;
+	/* Check bounds */
+	if (!is_write && pos >= inode->i_size)
+		return VM_FAULT_SIGBUS;
 
-		sb_start_pagefault(sb);
-		data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
-		sb_end_pagefault(sb);
+	if (is_write && (sb->s_flags & SB_RDONLY))
+		return VM_FAULT_SIGBUS;
 
-		if (!data)
-			return VM_FAULT_SIGBUS;
-	} else {
-		/* Read fault - find existing data */
-		if (pos >= inode->i_size)
-			return VM_FAULT_SIGBUS;
+	/*
+	 * For mmap, we always need page-aligned data. Use daxfs_get_write_extent
+	 * which allocates page-aligned delta extents and handles COW from base
+	 * image automatically.
+	 *
+	 * For read faults on writable mappings, we allocate writable extents
+	 * so subsequent writes don't need pfn_mkwrite (simpler code path).
+	 *
+	 * For read faults on read-only mappings, we still allocate (for
+	 * alignment), but map read-only.
+	 */
+	sb_start_pagefault(sb);
+	data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
+	sb_end_pagefault(sb);
 
-		data = daxfs_resolve_file_data(sb, inode->i_ino, pos, PAGE_SIZE, &data_len);
-		if (!data) {
-			/*
-			 * No data at this position (hole). For DAX we need to
-			 * allocate a zero page. Allocate from delta log.
-			 */
-			sb_start_pagefault(sb);
-			data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
-			sb_end_pagefault(sb);
+	if (!data)
+		return VM_FAULT_SIGBUS;
 
-			if (!data)
-				return VM_FAULT_SIGBUS;
-		}
-	}
-
-	/* Get physical address */
+	/* Get physical address - data is now guaranteed page-aligned */
 	phys = daxfs_mem_phys(info, daxfs_mem_offset(info, data));
 	if (!phys)
 		return VM_FAULT_SIGBUS;
 
 	pfn = phys >> PAGE_SHIFT;
 
-	/* Insert the PFN mapping */
-	ret = vmf_insert_pfn(vma, vmf->address, pfn);
+	/*
+	 * For write faults, add _PAGE_RW to the protection. vma->vm_page_prot
+	 * may be read-only for shared mappings (kernel dirty tracking).
+	 */
+	if (is_write)
+		prot = __pgprot(pgprot_val(vma->vm_page_prot) | _PAGE_RW);
+	else
+		prot = vma->vm_page_prot;
 
-	return ret;
+	return vmf_insert_pfn_prot(vma, vmf->address, pfn, prot);
 }
 
 /*
  * DAX pfn_mkwrite handler - called to upgrade a write-protected PFN
  * mapping to writable.
  *
- * This is the COW path: when a page was initially mapped read-only
- * (pointing to base image), and the user writes to it, we need to:
- * 1. Allocate a new delta extent with a copy of the data
- * 2. Zap the old mapping (which points to base image)
- * 3. Insert a new writable mapping pointing to delta extent
+ * This is called when a read-mapped page is being written to.
+ * The fault handler already allocated a page-aligned delta extent,
+ * so we just need to upgrade the PTE protection to writable.
  */
 static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 {
@@ -612,9 +638,9 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 	}
 
 	/*
-	 * Allocate writable extent with COW of existing data.
-	 * daxfs_get_write_extent copies existing data from base image
-	 * or parent delta into the new extent.
+	 * Get the existing delta extent. The fault handler should have
+	 * already allocated a page-aligned extent for this position.
+	 * If not, allocate one now (shouldn't normally happen).
 	 */
 	sb_start_pagefault(sb);
 	data = daxfs_get_write_extent(inode, pos, PAGE_SIZE, &data_len);
@@ -630,15 +656,18 @@ static vm_fault_t daxfs_dax_pfn_mkwrite(struct vm_fault *vmf)
 	pfn = phys >> PAGE_SHIFT;
 
 	/*
-	 * Zap the old PTE before inserting the new one. The old mapping
-	 * may point to base image (read-only), but we now need to point
-	 * to the delta extent (writable). Without zapping, vmf_insert_pfn
-	 * would fail because a mapping already exists.
+	 * Zap the old read-only PTE before inserting the writable one.
+	 * This is necessary because vmf_insert_pfn_prot will fail if
+	 * a PTE already exists at this address.
 	 */
 	zap_vma_ptes(vma, vmf->address, PAGE_SIZE);
 
-	/* Insert the new PFN mapping pointing to delta extent */
-	return vmf_insert_pfn(vma, vmf->address, pfn);
+	/*
+	 * Insert writable PFN mapping with _PAGE_RW added to the base
+	 * protection.
+	 */
+	return vmf_insert_pfn_prot(vma, vmf->address, pfn,
+			__pgprot(pgprot_val(vma->vm_page_prot) | _PAGE_RW));
 }
 
 static const struct vm_operations_struct daxfs_dax_vm_ops = {

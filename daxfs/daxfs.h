@@ -204,6 +204,10 @@ extern int daxfs_delta_init_branch(struct daxfs_info *info,
 extern void daxfs_delta_destroy_branch(struct daxfs_branch_ctx *branch);
 extern void *daxfs_delta_alloc(struct daxfs_info *info,
 			       struct daxfs_branch_ctx *branch, size_t size);
+extern void *daxfs_delta_alloc_mmap(struct daxfs_info *info,
+				    struct daxfs_branch_ctx *branch,
+				    size_t header_size, size_t data_size,
+				    void **data_out, size_t *total_out);
 extern int daxfs_delta_append(struct daxfs_branch_ctx *branch, u32 type,
 			      u64 ino, void *data, size_t data_len);
 extern int daxfs_delta_build_index(struct daxfs_branch_ctx *branch);
@@ -221,6 +225,9 @@ extern int daxfs_resolve_inode(struct super_block *sb, u64 ino,
 			       umode_t *mode, loff_t *size, bool *deleted);
 extern void *daxfs_resolve_file_data(struct super_block *sb, u64 ino,
 				     loff_t pos, size_t len, size_t *out_len);
+extern void *daxfs_resolve_file_data_ex(struct super_block *sb, u64 ino,
+					loff_t pos, size_t len, size_t *out_len,
+					bool *from_base);
 extern void *daxfs_lookup_write_extent(struct daxfs_branch_ctx *branch,
 				       u64 ino, loff_t pos, size_t len,
 				       size_t *out_len);
