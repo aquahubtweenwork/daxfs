@@ -10,7 +10,13 @@
 
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/overflow.h>
 #include "daxfs.h"
+
+static inline bool check_add_overflow_u64(u64 a, u64 b, u64 *result)
+{
+	return check_add_overflow(a, b, result);
+}
 
 /*
  * Validate hard link consistency in the base image.
@@ -38,14 +44,33 @@ static int daxfs_validate_hardlinks(struct daxfs_info *info)
 		if (S_ISDIR(mode)) {
 			u64 file_data_offset = le64_to_cpu(raw->data_offset);
 			u64 file_size = le64_to_cpu(raw->size);
-			u32 num_entries = file_size / DAXFS_DIRENT_SIZE;
+			u64 num_entries_u64;
+			u32 num_entries;
 			struct daxfs_dirent *dirents;
+			u64 dirent_offset;
 			u32 j;
 
 			if (file_size == 0)
 				continue;
 
-			dirents = daxfs_mem_ptr(info, base_offset + file_data_offset);
+			/* Check for overflow in offset calculation */
+			if (check_add_overflow_u64(base_offset, file_data_offset,
+						   &dirent_offset)) {
+				pr_err("daxfs: dir %u offset overflow\n", i + 1);
+				ret = -EINVAL;
+				goto out;
+			}
+
+			/* Validate num_entries fits in u32 */
+			num_entries_u64 = file_size / DAXFS_DIRENT_SIZE;
+			if (num_entries_u64 > U32_MAX) {
+				pr_err("daxfs: dir %u has too many entries\n", i + 1);
+				ret = -EINVAL;
+				goto out;
+			}
+			num_entries = (u32)num_entries_u64;
+
+			dirents = daxfs_mem_ptr(info, dirent_offset);
 
 			for (j = 0; j < num_entries; j++) {
 				u32 child_ino = le32_to_cpu(dirents[j].ino);
@@ -137,6 +162,10 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 	inode_offset = le64_to_cpu(base->inode_offset);
 	data_offset = le64_to_cpu(base->data_offset);
 	inode_count = le32_to_cpu(base->inode_count);
+	if (inode_count == 0) {
+		pr_err("daxfs: base image has no inodes\n");
+		return -EINVAL;
+	}
 
 	/* Validate inode table bounds */
 	if (inode_offset > base_size ||
@@ -150,6 +179,17 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 	    le32_to_cpu(base->root_inode) > inode_count) {
 		pr_err("daxfs: invalid root inode number\n");
 		return -EINVAL;
+	}
+
+	/* Validate root inode is a directory */
+	{
+		u32 root_idx = le32_to_cpu(base->root_inode) - 1;
+		u32 root_mode = le32_to_cpu(info->base_inodes[root_idx].mode);
+
+		if (!S_ISDIR(root_mode)) {
+			pr_err("daxfs: root inode is not a directory\n");
+			return -EINVAL;
+		}
 	}
 
 	/* Validate each inode's data offset and type-specific constraints */
@@ -169,9 +209,11 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 
 		/* For directories, validate dirent array */
 		if (S_ISDIR(mode) && file_size > 0) {
-			u32 num_entries = file_size / DAXFS_DIRENT_SIZE;
+			u64 num_entries_u64;
+			u32 num_entries;
 			u32 j;
 			struct daxfs_dirent *dirents;
+			u64 dirent_offset;
 
 			/* Size must be multiple of DAXFS_DIRENT_SIZE */
 			if (file_size % DAXFS_DIRENT_SIZE != 0) {
@@ -179,7 +221,22 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 				return -EINVAL;
 			}
 
-			dirents = daxfs_mem_ptr(info, base_offset + file_data_offset);
+			/* Validate num_entries fits in u32 */
+			num_entries_u64 = file_size / DAXFS_DIRENT_SIZE;
+			if (num_entries_u64 > U32_MAX) {
+				pr_err("daxfs: dir inode %u has too many entries\n", i + 1);
+				return -EINVAL;
+			}
+			num_entries = (u32)num_entries_u64;
+
+			/* Check for overflow in offset calculation */
+			if (check_add_overflow_u64(base_offset, file_data_offset,
+						   &dirent_offset)) {
+				pr_err("daxfs: dir inode %u offset overflow\n", i + 1);
+				return -EINVAL;
+			}
+
+			dirents = daxfs_mem_ptr(info, dirent_offset);
 
 			/* Validate each dirent */
 			for (j = 0; j < num_entries; j++) {
@@ -203,9 +260,18 @@ int daxfs_validate_base_image(struct daxfs_info *info)
 
 		/* For symlinks, ensure null-termination */
 		if (S_ISLNK(mode) && file_size > 0) {
-			char *target = daxfs_mem_ptr(info,
-				base_offset + file_data_offset);
+			u64 symlink_offset;
+			char *target;
 			size_t check_len = file_size + 1;
+
+			/* Check for overflow in offset calculation */
+			if (check_add_overflow_u64(base_offset, file_data_offset,
+						   &symlink_offset)) {
+				pr_err("daxfs: inode %u symlink offset overflow\n", i + 1);
+				return -EINVAL;
+			}
+
+			target = daxfs_mem_ptr(info, symlink_offset);
 
 			/* Ensure we have space to check for null terminator */
 			if (!daxfs_valid_base_offset(info, file_data_offset, check_len)) {
