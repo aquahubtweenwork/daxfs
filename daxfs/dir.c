@@ -192,7 +192,7 @@ static int daxfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	inode_set_mtime_to_ts(dir,
 		inode_set_ctime_to_ts(dir, current_time(dir)));
 
-	d_instantiate(dentry, inode);
+	d_instantiate_new(dentry, inode);
 	return 0;
 }
 
@@ -259,7 +259,7 @@ static struct dentry *daxfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	inode_set_mtime_to_ts(dir,
 		inode_set_ctime_to_ts(dir, current_time(dir)));
 
-	d_instantiate(dentry, inode);
+	d_instantiate_new(dentry, inode);
 	return NULL;
 }
 
@@ -427,7 +427,7 @@ static int daxfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 	inode_set_mtime_to_ts(dir,
 		inode_set_ctime_to_ts(dir, current_time(dir)));
 
-	d_instantiate(dentry, inode);
+	d_instantiate_new(dentry, inode);
 	return 0;
 }
 

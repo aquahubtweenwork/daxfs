@@ -191,9 +191,15 @@ struct inode *daxfs_new_inode(struct super_block *sb, umode_t mode, u64 ino)
 	struct daxfs_inode_info *di;
 	struct timespec64 now;
 
-	inode = new_inode(sb);
+	inode = iget_locked(sb, ino);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
+
+	if (!(inode_state_read_once(inode) & I_NEW)) {
+		/* Inode already exists - shouldn't happen for new allocation */
+		iput(inode);
+		return ERR_PTR(-EEXIST);
+	}
 
 	di = DAXFS_I(inode);
 	di->raw = NULL;
@@ -201,7 +207,6 @@ struct inode *daxfs_new_inode(struct super_block *sb, umode_t mode, u64 ino)
 	di->delta_size = 0;
 	di->from_delta = true;
 
-	inode->i_ino = ino;
 	inode->i_mode = mode;
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();
@@ -231,7 +236,7 @@ struct inode *daxfs_new_inode(struct super_block *sb, umode_t mode, u64 ino)
 		break;
 	}
 
-	insert_inode_hash(inode);
+	/* Don't unlock here - caller must use d_instantiate_new() */
 	return inode;
 }
 
