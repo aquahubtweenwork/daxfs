@@ -349,9 +349,9 @@ static int daxfs_reconfigure(struct fs_context *fc)
 		struct daxfs_branch_ctx *branch = info->current_branch;
 		struct daxfs_branch_ctx *main_branch;
 
-		if (!branch->parent) {
-			pr_err("daxfs: cannot commit main branch\n");
-			return -EINVAL;
+		if (!branch || !branch->parent) {
+			pr_err("daxfs: commit not supported: no child branch active\n");
+			return -EOPNOTSUPP;
 		}
 
 		main_branch = daxfs_find_branch_by_name(info, "main");
@@ -377,9 +377,9 @@ static int daxfs_reconfigure(struct fs_context *fc)
 		struct daxfs_branch_ctx *branch = info->current_branch;
 		struct daxfs_branch_ctx *main_branch;
 
-		if (!branch->parent) {
-			pr_err("daxfs: cannot abort main branch\n");
-			return -EINVAL;
+		if (!branch || !branch->parent) {
+			pr_err("daxfs: abort not supported: no child branch active\n");
+			return -EOPNOTSUPP;
 		}
 
 		main_branch = daxfs_find_branch_by_name(info, "main");
