@@ -24,11 +24,48 @@
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
 #include <stdbool.h>
 #include <getopt.h>
+#include <linux/mount.h>
 #include <daxfs_format.h>
 
 #define PROC_MOUNTS "/proc/mounts"
+
+/* New mount API syscall wrappers */
+#ifndef FSCONFIG_SET_FLAG
+#define FSCONFIG_SET_FLAG	0
+#define FSCONFIG_SET_STRING	1
+#define FSCONFIG_SET_FD		5
+#define FSCONFIG_CMD_CREATE	6
+#endif
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#define MOVE_MOUNT_F_EMPTY_PATH	0x00000004
+#endif
+
+static inline int sys_fsopen(const char *fstype, unsigned int flags)
+{
+	return syscall(__NR_fsopen, fstype, flags);
+}
+
+static inline int sys_fsconfig(int fd, unsigned int cmd, const char *key,
+			       const void *value, int aux)
+{
+	return syscall(__NR_fsconfig, fd, cmd, key, value, aux);
+}
+
+static inline int sys_fsmount(int fd, unsigned int flags, unsigned int attr_flags)
+{
+	return syscall(__NR_fsmount, fd, flags, attr_flags);
+}
+
+static inline int sys_move_mount(int from_dfd, const char *from_path,
+				 int to_dfd, const char *to_path,
+				 unsigned int flags)
+{
+	return syscall(__NR_move_mount, from_dfd, from_path,
+		       to_dfd, to_path, flags);
+}
 
 struct mount_info {
 	char *mountpoint;
@@ -296,11 +333,91 @@ static int get_dmabuf_fd(const char *existing_mount)
 	return dmabuf_fd;
 }
 
+/*
+ * Mount a daxfs branch using the new mount API.
+ * This is required because fd parameters can't be passed via mount command.
+ */
+static int mount_daxfs_branch(int dmabuf_fd, const char *phys, const char *size,
+			      const char *branch, const char *parent,
+			      const char *mountpoint)
+{
+	int fs_fd, mnt_fd;
+
+	fs_fd = sys_fsopen("daxfs", 0);
+	if (fs_fd < 0) {
+		perror("fsopen(daxfs)");
+		return -1;
+	}
+
+	/* Set backing store - either dmabuf fd or phys/size */
+	if (dmabuf_fd >= 0) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_FD, "dmabuf", NULL, dmabuf_fd) < 0) {
+			perror("fsconfig(dmabuf)");
+			close(fs_fd);
+			return -1;
+		}
+	} else if (phys && size) {
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "phys", phys, 0) < 0) {
+			perror("fsconfig(phys)");
+			close(fs_fd);
+			return -1;
+		}
+		if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "size", size, 0) < 0) {
+			perror("fsconfig(size)");
+			close(fs_fd);
+			return -1;
+		}
+	} else {
+		fprintf(stderr, "Error: no backing store specified\n");
+		close(fs_fd);
+		return -1;
+	}
+
+	/* Set branch and parent */
+	if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "branch", branch, 0) < 0) {
+		perror("fsconfig(branch)");
+		close(fs_fd);
+		return -1;
+	}
+
+	if (sys_fsconfig(fs_fd, FSCONFIG_SET_STRING, "parent", parent, 0) < 0) {
+		perror("fsconfig(parent)");
+		close(fs_fd);
+		return -1;
+	}
+
+	/* Create the superblock */
+	if (sys_fsconfig(fs_fd, FSCONFIG_CMD_CREATE, NULL, NULL, 0) < 0) {
+		perror("fsconfig(CMD_CREATE)");
+		close(fs_fd);
+		return -1;
+	}
+
+	/* Create mount fd - child branches are writable */
+	mnt_fd = sys_fsmount(fs_fd, 0, 0);
+	if (mnt_fd < 0) {
+		perror("fsmount");
+		close(fs_fd);
+		return -1;
+	}
+	close(fs_fd);
+
+	/* Move mount to the target mountpoint */
+	if (sys_move_mount(mnt_fd, "", AT_FDCWD, mountpoint,
+			   MOVE_MOUNT_F_EMPTY_PATH) < 0) {
+		perror("move_mount");
+		close(mnt_fd);
+		return -1;
+	}
+	close(mnt_fd);
+
+	return 0;
+}
+
 static int cmd_create(const char *mountpoint, const char *branch,
 		      const char *parent)
 {
 	struct mount_info mi = {0};
-	char options[512];
 	int dmabuf_fd = -1;
 	int ret;
 
@@ -329,24 +446,10 @@ static int cmd_create(const char *mountpoint, const char *branch,
 
 	/* Try to get dmabuf fd from existing mount */
 	dmabuf_fd = get_dmabuf_fd(mi.mountpoint);
-	if (dmabuf_fd >= 0) {
-		/* dmabuf-based mount */
-		snprintf(options, sizeof(options), "dmabuf=%d,branch=%s,parent=%s",
-			 dmabuf_fd, branch, parent);
-	} else if (mi.phys && mi.size) {
-		/* phys-based mount */
-		snprintf(options, sizeof(options), "phys=%s,size=%s,branch=%s,parent=%s",
-			 mi.phys, mi.size, branch, parent);
-	} else {
-		fprintf(stderr, "Error: cannot determine backing store\n");
-		free_mount_info(&mi);
-		return 1;
-	}
 
-	/* Note: dmabuf_fd is inherited by forked child, so fd number stays valid */
-	char *argv[] = {"mount", "-t", "daxfs", "-o", options, "none",
-			(char *)mountpoint, NULL};
-	ret = run_mount(argv);
+	/* Mount the branch using new mount API */
+	ret = mount_daxfs_branch(dmabuf_fd, mi.phys, mi.size,
+				 branch, parent, mountpoint);
 
 	if (dmabuf_fd >= 0)
 		close(dmabuf_fd);
