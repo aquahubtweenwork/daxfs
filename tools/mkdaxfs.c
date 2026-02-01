@@ -480,7 +480,7 @@ static inline int sys_move_mount(int from_dfd, const char *from_path,
  * Mount a daxfs filesystem backed by a dma-buf fd using the new mount API.
  */
 static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint,
-			      bool writable, bool validate)
+			      bool branching, bool validate)
 {
 	int fs_fd, mnt_fd;
 
@@ -512,7 +512,7 @@ static int mount_daxfs_dmabuf(int dmabuf_fd, const char *mountpoint,
 		return -1;
 	}
 
-	mnt_fd = sys_fsmount(fs_fd, 0, writable ? 0 : MOUNT_ATTR_RDONLY);
+	mnt_fd = sys_fsmount(fs_fd, 0, branching ? 0 : MOUNT_ATTR_RDONLY);
 	if (mnt_fd < 0) {
 		perror("fsmount");
 		close(fs_fd);
@@ -673,16 +673,16 @@ static void print_usage(const char *prog)
 	fprintf(stderr, "  -m, --mountpoint DIR   Mount after creating (required with -H)\n");
 	fprintf(stderr, "  -p, --phys ADDR        Write to physical address via /dev/mem\n");
 	fprintf(stderr, "  -s, --size SIZE        Size to allocate (required with -H or -p)\n");
-	fprintf(stderr, "  -w, --writable         Enable branching and mount read-write\n");
+	fprintf(stderr, "  -b, --branching        Enable branching support (adds branch table and delta region)\n");
 	fprintf(stderr, "  -V, --validate         Validate image on mount\n");
-	fprintf(stderr, "  -D, --delta SIZE       Delta region size (default: 64M, only with -w)\n");
+	fprintf(stderr, "  -D, --delta SIZE       Delta region size (default: 64M, only with -b)\n");
 	fprintf(stderr, "  -h, --help             Show this help\n");
 	fprintf(stderr, "\nBy default, creates a static read-only image without branching support.\n");
-	fprintf(stderr, "Use -w to enable branching (adds branch table and delta region).\n");
+	fprintf(stderr, "Use -b to enable branching (adds branch table and delta region).\n");
 	fprintf(stderr, "\nExamples:\n");
 	fprintf(stderr, "  %s -d /path/to/rootfs -o image.daxfs\n", prog);
 	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -s 64M -m /mnt\n", prog);
-	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -s 256M -m /mnt -w\n", prog);
+	fprintf(stderr, "  %s -d /path/to/rootfs -H /dev/dma_heap/system -s 256M -m /mnt -b\n", prog);
 	fprintf(stderr, "  %s -d /path/to/rootfs -p 0x100000000 -s 256M\n", prog);
 }
 
@@ -696,7 +696,7 @@ int main(int argc, char *argv[])
 		{"phys", required_argument, 0, 'p'},
 		{"size", required_argument, 0, 's'},
 		{"delta", required_argument, 0, 'D'},
-		{"writable", no_argument, 0, 'w'},
+		{"branching", no_argument, 0, 'b'},
 		{"validate", no_argument, 0, 'V'},
 		{"help", no_argument, 0, 'h'},
 		{0, 0, 0, 0}
@@ -715,10 +715,10 @@ int main(int argc, char *argv[])
 	int opt;
 	int ret = 1;
 	size_t delta_size = DAXFS_DEFAULT_DELTA_SIZE;
-	bool writable = false;
+	bool branching = false;
 	bool validate = false;
 
-	while ((opt = getopt_long(argc, argv, "d:o:H:m:p:s:D:wVh", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:H:m:p:s:D:bVh", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'd':
 			src_dir = optarg;
@@ -749,8 +749,8 @@ int main(int argc, char *argv[])
 			else if (strchr(optarg, 'G') || strchr(optarg, 'g'))
 				delta_size *= 1024 * 1024 * 1024;
 			break;
-		case 'w':
-			writable = true;
+		case 'b':
+			branching = true;
 			break;
 		case 'V':
 			validate = true;
@@ -796,20 +796,20 @@ int main(int argc, char *argv[])
 	calculate_offsets();
 
 	base_size = calculate_base_size();
-	if (writable)
+	if (branching)
 		total_size = calculate_total_size(base_size, delta_size);
 	else
 		total_size = calculate_static_size(base_size);
 
 	printf("Base image size: %zu bytes (%.2f MB)\n", base_size,
 	       (double)base_size / (1024 * 1024));
-	if (writable) {
+	if (branching) {
 		printf("Delta region size: %zu bytes (%.2f MB)\n", delta_size,
 		       (double)delta_size / (1024 * 1024));
 	}
 	printf("Total image size: %zu bytes (%.2f MB)\n", total_size,
 	       (double)total_size / (1024 * 1024));
-	printf("Mode: %s\n", writable ? "read-write (with branching)" : "read-only (static)");
+	printf("Mode: %s\n", branching ? "branching" : "static (read-only)");
 
 	if (heap_path) {
 		/* Allocate from DMA heap and write */
@@ -852,7 +852,7 @@ int main(int argc, char *argv[])
 		}
 
 		printf("Writing daxfs image...\n");
-		if (writable) {
+		if (branching) {
 			if (write_image(mem, max_size, src_dir, base_size, delta_size) < 0) {
 				munmap(mem, max_size);
 				close(dmabuf_fd);
@@ -870,9 +870,9 @@ int main(int argc, char *argv[])
 
 		/* Mount using the dma-buf fd via the new mount API */
 		printf("Mounting on %s (%s%s)...\n", mountpoint,
-		       writable ? "read-write" : "read-only",
+		       branching ? "branching" : "read-only",
 		       validate ? ", validating" : "");
-		if (mount_daxfs_dmabuf(dmabuf_fd, mountpoint, writable, validate) < 0) {
+		if (mount_daxfs_dmabuf(dmabuf_fd, mountpoint, branching, validate) < 0) {
 			close(dmabuf_fd);
 			return 1;
 		}
@@ -905,7 +905,7 @@ int main(int argc, char *argv[])
 		}
 
 		printf("Writing to physical address 0x%llx...\n", phys_addr);
-		if (writable) {
+		if (branching) {
 			if (write_image(mem, max_size, src_dir, base_size, delta_size) < 0) {
 				munmap(mem, max_size);
 				return 1;
@@ -945,7 +945,7 @@ int main(int argc, char *argv[])
 		}
 
 		printf("Writing to %s...\n", output_file);
-		if (writable) {
+		if (branching) {
 			if (write_image(mem, total_size, src_dir, base_size, delta_size) < 0) {
 				munmap(mem, total_size);
 				return 1;
